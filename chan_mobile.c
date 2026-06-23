@@ -104,10 +104,6 @@ static int unloading_flag = 0;
 static inline int check_unloading(void);
 static inline void set_unloading(void);
 
-enum mbl_type {
-	MBL_TYPE_PHONE
-};
-
 /* SMS operating modes */
 enum sms_mode {
 	SMS_MODE_OFF = 0,   /*!< Disabled via configuration */
@@ -167,7 +163,6 @@ struct mbl_pvt {
 	ast_mutex_t lock;				/*!< pvt lock */
 	/*! queue for messages we are expecting */
 	AST_LIST_HEAD_NOLOCK(msg_queue, msg_queue_entry) msg_queue;
-	enum mbl_type type;				/*!< Device type (phone) */
 	enum mbl_state state;				/*!< Device state */
 	char id[31];					/*!< The id from mobile.conf */
 	char remote_name[32];				/*!< Remote device name */
@@ -612,7 +607,7 @@ static int hfp_parse_brsf(struct hfp_pvt *hfp, const char *buf);
 static int hfp_parse_cind(struct hfp_pvt *hfp, char *buf);
 static int hfp_parse_cind_test(struct hfp_pvt *hfp, char *buf);
 static char *hfp_parse_cusd(struct hfp_pvt *hfp, char *buf);
-static int hfp_parse_cscs(struct hfp_pvt *hfp, char *buf, struct mbl_pvt *pvt);
+static int hfp_parse_cscs(char *buf, struct mbl_pvt *pvt);
 static int hfp_parse_creg(char *buf);
 static int hfp_parse_cops(char *buf, char *oper, size_t oper_len, int *format);
 static int hfp_parse_cbc(char *buf, int *level, int *charging);
@@ -627,9 +622,6 @@ static int hfp_send_cmer(struct hfp_pvt *hfp, int status);
 static int hfp_send_clip(struct hfp_pvt *hfp, int status);
 static int hfp_send_vgs(struct hfp_pvt *hfp, int value);
 
-#if 0
-static int hfp_send_vgm(struct hfp_pvt *hfp, int value);
-#endif
 static int hfp_send_dtmf(struct hfp_pvt *hfp, char digit);
 static int hfp_send_cmgf(struct hfp_pvt *hfp, int mode);
 static int hfp_send_cnmi(struct hfp_pvt *hfp, int mode);
@@ -2421,8 +2413,6 @@ static int rfcomm_wait(int rsock, int *ms)
 	return outfd;
 }
 
-#define RFCOMM_READ_DEBUG 1
-#ifdef RFCOMM_READ_DEBUG
 #define rfcomm_read_debug(c) __rfcomm_read_debug(c)
 static void __rfcomm_read_debug(char c)
 {
@@ -2436,9 +2426,6 @@ static void __rfcomm_read_debug(char c)
 		ast_debug(3, "rfcomm_read: 0x%02X\n", (unsigned char)c);
 	}
 }
-#else
-#define rfcomm_read_debug(c)
-#endif
 
 /*!
  * \brief Append the given character to the given buffer and increase the
@@ -2942,19 +2929,6 @@ static int sco_connect(bdaddr_t src, bdaddr_t dst, int *mtu)
 	}
 #else
 	ast_log(LOG_NOTICE, "BT_VOICE not available in this kernel - using default codec negotiation\n");
-#endif
-
-/* XXX this does not work with the do_sco_listen() thread (which also bind()s
- * to this address).  Also I am not sure if it is necessary. */
-#if 0
-	memset(&addr, 0, sizeof(addr));
-	addr.sco_family = AF_BLUETOOTH;
-	bacpy(&addr.sco_bdaddr, &src);
-	if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-		ast_debug(1, "bind() failed (%d).\n", errno);
-		close(s);
-		return -1;
-	}
 #endif
 
 	memset(&addr, 0, sizeof(addr));
@@ -7376,7 +7350,7 @@ static int sms_decode_pdu(const char *pdu_hex, char *from_number, size_t from_le
 	int pdu_type;
 	int oa_len, oa_type;
 	int oa_bytes;
-	int pid, dcs;
+	int dcs;
 	int udl;
 	int udhi;  /* User Data Header Indicator */
 	int udhl = 0;  /* User Data Header Length (in bytes) */
@@ -7419,12 +7393,11 @@ static int sms_decode_pdu(const char *pdu_hex, char *from_number, size_t from_le
 	decode_phone_bcd(&pdu[idx], oa_len, oa_type, from_number, from_len);
 	idx += oa_bytes;
 	
-	/* Protocol ID */
+	/* Protocol ID - read to advance index, value not used */
 	if (idx >= pdu_len) {
 		return -1;
 	}
-	pid = pdu[idx++];
-	(void)pid;
+	idx++;
 	
 	/* Data Coding Scheme */
 	if (idx >= pdu_len) {
@@ -7893,13 +7866,10 @@ static int handle_response_cusd(struct mbl_pvt *pvt, char *buf)
  * \param buf the buffer to parse (null terminated)
  * \return 1 if UTF-8 is found/supported, 0 otherwise
  */
-static int hfp_parse_cscs(struct hfp_pvt *hfp, char *buf, struct mbl_pvt *pvt)
+static int hfp_parse_cscs(char *buf, struct mbl_pvt *pvt)
 {
 	int found = 0;
 	char *start;
-
-	/* Suppress unused parameter warning */
-	(void)hfp;
 
 	/* Store raw list for display (strip +CSCS: prefix) */
 	start = strchr(buf, ':');
@@ -8301,12 +8271,12 @@ static void *do_monitor_phone(void *data)
 			if ((entry = msg_queue_head(pvt))) {
 				if (entry->response_to == AT_CSCS) {
 					/* Capability Query */
-					if (hfp_parse_cscs(hfp, buf, pvt)) {
+					if (hfp_parse_cscs(buf, pvt)) {
 						pvt->utf8_candidate = 1;
 					}
 				} else if (entry->response_to == AT_CSCS_VERIFY) {
 					/* Verify Query */
-					if (hfp_parse_cscs(hfp, buf, pvt)) {
+					if (hfp_parse_cscs(buf, pvt)) {
 						pvt->has_utf8 = 1;
 					}
 				}
@@ -9321,7 +9291,6 @@ static struct mbl_pvt *mbl_load_device(struct ast_config *cfg, const char *cat)
 
 	/* set some defaults */
 
-	pvt->type = MBL_TYPE_PHONE;
 	ast_copy_string(pvt->context, "default", sizeof(pvt->context));
 
 	/* populate the pvt structure */
