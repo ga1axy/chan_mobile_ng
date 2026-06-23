@@ -105,8 +105,7 @@ static inline int check_unloading(void);
 static inline void set_unloading(void);
 
 enum mbl_type {
-	MBL_TYPE_PHONE,
-	MBL_TYPE_HEADSET
+	MBL_TYPE_PHONE
 };
 
 /* SMS operating modes */
@@ -125,7 +124,7 @@ enum mbl_state {
 	MBL_STATE_INIT,         /* Just loaded from config */
 	MBL_STATE_DISCONNECTED, /* Not connected */
 	MBL_STATE_CONNECTING,   /* RFCOMM connection in progress */
-	MBL_STATE_CONNECTED,    /* RFCOMM connected, initializing HFP/HSP */
+	MBL_STATE_CONNECTED,    /* RFCOMM connected, initializing HFP */
 	MBL_STATE_READY,        /* Fully initialized, ready for calls */
 	MBL_STATE_RING,         /* Incoming call ringing */
 	MBL_STATE_DIAL,         /* Outgoing call dialing */
@@ -168,11 +167,11 @@ struct mbl_pvt {
 	ast_mutex_t lock;				/*!< pvt lock */
 	/*! queue for messages we are expecting */
 	AST_LIST_HEAD_NOLOCK(msg_queue, msg_queue_entry) msg_queue;
-	enum mbl_type type;				/*!< Phone or Headset */
+	enum mbl_type type;				/*!< Device type (phone) */
 	enum mbl_state state;				/*!< Device state */
 	char id[31];					/*!< The id from mobile.conf */
 	char remote_name[32];				/*!< Remote device name */
-	char profile_name[8];				/*!< "HFP" or "HSP" */
+	char profile_name[8];				/*!< "HFP" */
 	int group;					/*!< group number for group dialling */
 	bdaddr_t addr;					/*!< address of device */
 	struct adapter_pvt *adapter;			/*!< the adapter we use */
@@ -460,7 +459,6 @@ static int sco_bind(struct adapter_pvt *adapter);
 static void *do_sco_listen(void *data);
 static int sdp_search(char *addr, int profile);
 
-static int headset_send_ring(const void *data);
 static int mbl_status_poll(const void *data);
 
 /*
@@ -667,15 +665,6 @@ static int gsm7_decode(const unsigned char *gsm7, int septets, char *utf8, size_
 static const char *sms_strip_udh_hex(const char *hex);
 static int sms_generate_concat_udh_hex(int ref, int total_parts, int part_num, char *udh_hex);
 static int sms_get_next_concat_ref(void);
-
-/*
- * bluetooth headset profile helpers
- */
-static int hsp_send_ok(int rsock);
-static int hsp_send_error(int rsock);
-static int hsp_send_vgs(int rsock, int gain);
-static int hsp_send_vgm(int rsock, int gain);
-static int hsp_send_ring(int rsock);
 
 /*
  * Hayes AT command helpers
@@ -1028,7 +1017,7 @@ static char *handle_cli_mobile_show_device(struct ast_cli_entry *e, int cmd, str
 	ast_cli(a->fd, "Device: %s\n", pvt->id);
 	ast_cli(a->fd, "Address: %s\n", bdaddr);
 	ast_cli(a->fd, "Name: %s\n", pvt->remote_name[0] ? pvt->remote_name : "-");
-	ast_cli(a->fd, "Type: %s\n", pvt->type == MBL_TYPE_PHONE ? "Phone" : "Headset");
+	ast_cli(a->fd, "Type: Phone\n");
 	ast_cli(a->fd, "State: %s\n", mbl_state2str(pvt->state));
 	ast_cli(a->fd, "Profile: %s\n", pvt->profile_name[0] ? pvt->profile_name : "-");
 
@@ -1349,12 +1338,12 @@ static char *handle_cli_mobile_search(struct ast_cli_entry *e, int cmd, struct a
 	inquiry_info *ii = NULL;
 	int max_rsp, num_rsp;
 	int len, flags;
-	int i, phport, hsport;
+	int i, phport;
 	char addr[19] = {0};
 	char name[31] = {0};
 
-#define FORMAT1 "%-17.17s %-30.30s %-6.6s %-7.7s %-4.4s\n"
-#define FORMAT2 "%-17.17s %-30.30s %-6.6s %-7.7s %d\n"
+#define FORMAT1 "%-17.17s %-30.30s %-6.6s %-4.4s\n"
+#define FORMAT2 "%-17.17s %-30.30s %-6.6s %d\n"
 
 	switch (cmd) {
 	case CLI_INIT:
@@ -1392,7 +1381,7 @@ static char *handle_cli_mobile_search(struct ast_cli_entry *e, int cmd, struct a
 	ii = ast_alloca(max_rsp * sizeof(inquiry_info));
 	num_rsp = hci_inquiry(adapter->dev_id, len, max_rsp, NULL, &ii, flags);
 	if (num_rsp > 0) {
-		ast_cli(a->fd, FORMAT1, "Address", "Name", "Usable", "Type", "Port");
+		ast_cli(a->fd, FORMAT1, "Address", "Name", "Usable", "Port");
 		for (i = 0; i < num_rsp; i++) {
 			ba2str(&(ii + i)->bdaddr, addr);
 			name[0] = 0x00;
@@ -1400,14 +1389,7 @@ static char *handle_cli_mobile_search(struct ast_cli_entry *e, int cmd, struct a
 				strcpy(name, "[unknown]");
 			}
 			phport = sdp_search(addr, HANDSFREE_AGW_PROFILE_ID);
-			if (!phport) {
-				hsport = sdp_search(addr, HEADSET_PROFILE_ID);
-			}
-			else {
-				hsport = 0;
-			}
-			ast_cli(a->fd, FORMAT2, addr, name, (phport > 0 || hsport > 0) ? "Yes" : "No",
-				(phport > 0) ? "Phone" : "Headset", (phport > 0) ? phport : hsport);
+			ast_cli(a->fd, FORMAT2, addr, name, (phport > 0) ? "Yes" : "No", phport);
 		}
 	} else {
 		ast_cli(a->fd, "No Bluetooth Cell / Mobile devices found.\n");
@@ -1847,7 +1829,7 @@ static struct ast_channel *mbl_request(const char *type, struct ast_format_cap *
 		return NULL;
 	}
 
-	if ((pvt->type == MBL_TYPE_PHONE) && !dest_num) {
+	if (!dest_num) {
 		ast_log(LOG_WARNING, "Can't determine destination number.\n");
 		*cause = AST_CAUSE_INCOMPATIBLE_DESTINATION;
 		return NULL;
@@ -1876,14 +1858,12 @@ static int mbl_call(struct ast_channel *ast, const char *dest, int timeout)
 
 	pvt = ast_channel_tech_pvt(ast);
 
-	if (pvt->type == MBL_TYPE_PHONE) {
-		dest_num = strchr(dest_dev, '/');
-		if (!dest_num) {
-			ast_log(LOG_WARNING, "Cant determine destination number.\n");
-			return -1;
-		}
-		*dest_num++ = 0x00;
+	dest_num = strchr(dest_dev, '/');
+	if (!dest_num) {
+		ast_log(LOG_WARNING, "Cant determine destination number.\n");
+		return -1;
 	}
+	*dest_num++ = 0x00;
 
 	if ((ast_channel_state(ast) != AST_STATE_DOWN) && (ast_channel_state(ast) != AST_STATE_RESERVED)) {
 		ast_log(LOG_WARNING, "mbl_call called on %s, neither down nor reserved\n", ast_channel_name(ast));
@@ -1893,31 +1873,14 @@ static int mbl_call(struct ast_channel *ast, const char *dest, int timeout)
 	ast_debug(1, "Calling %s on %s\n", dest, ast_channel_name(ast));
 
 	ast_mutex_lock(&pvt->lock);
-	if (pvt->type == MBL_TYPE_PHONE) {
-		if (hfp_send_atd(pvt->hfp, dest_num)) {
-			ast_mutex_unlock(&pvt->lock);
-			ast_log(LOG_ERROR, "error sending ATD command on %s\n", pvt->id);
-			return -1;
-		}
-		pvt->hangupcause = 0;
-		pvt->needchup = 1;
-		msg_queue_push(pvt, AT_OK, AT_D);
-	} else {
-		if (hsp_send_ring(pvt->rfcomm_socket)) {
-			ast_log(LOG_ERROR, "[%s] error ringing device\n", pvt->id);
-			ast_mutex_unlock(&pvt->lock);
-			return -1;
-		}
-
-		if ((pvt->ring_sched_id = ast_sched_add(pvt->sched, 6000, headset_send_ring, pvt)) == -1) {
-			ast_log(LOG_ERROR, "[%s] error ringing device\n", pvt->id);
-			ast_mutex_unlock(&pvt->lock);
-			return -1;
-		}
-
-		pvt->outgoing = 1;
-		pvt->needring = 1;
+	if (hfp_send_atd(pvt->hfp, dest_num)) {
+		ast_mutex_unlock(&pvt->lock);
+		ast_log(LOG_ERROR, "error sending ATD command on %s\n", pvt->id);
+		return -1;
 	}
+	pvt->hangupcause = 0;
+	pvt->needchup = 1;
+	msg_queue_push(pvt, AT_OK, AT_D);
 	ast_mutex_unlock(&pvt->lock);
 
 	return 0;
@@ -1969,10 +1932,6 @@ static int mbl_answer(struct ast_channel *ast)
 
 	pvt = ast_channel_tech_pvt(ast);
 
-	if (pvt->type == MBL_TYPE_HEADSET) {
-		return 0;
-	}
-
 	ast_mutex_lock(&pvt->lock);
 	if (pvt->incoming) {
 		hfp_send_ata(pvt->hfp);
@@ -1988,10 +1947,6 @@ static int mbl_answer(struct ast_channel *ast)
 static int mbl_digit_end(struct ast_channel *ast, char digit, unsigned int duration)
 {
 	struct mbl_pvt *pvt = ast_channel_tech_pvt(ast);
-
-	if (pvt->type == MBL_TYPE_HEADSET) {
-		return 0;
-	}
 
 	ast_mutex_lock(&pvt->lock);
 	if (hfp_send_dtmf(pvt->hfp, digit)) {
@@ -2304,10 +2259,6 @@ static int mbl_ast_hangup(struct mbl_pvt *pvt)
  */
 static int mbl_has_service(struct mbl_pvt *pvt)
 {
-
-	if (pvt->type != MBL_TYPE_PHONE) {
-		return 1;
-	}
 
 	if (!pvt->hfp->cind_map.service) {
 		return 1;
@@ -4117,8 +4068,8 @@ static int hfp_send_cbc(struct hfp_pvt *hfp)
 	return rfcomm_write(hfp->rsock, "AT+CBC\r");
 }
 
-/*
- * bluetooth headset profile helpers calling line identification.
+/*!
+ * \brief Enable or disable calling line identification (CLIP).
  * \param hfp an hfp_pvt struct
  * \param status enable or disable calling line identification (should be 1 or
  * 0)
@@ -4778,61 +4729,6 @@ static int hfp_parse_cind_test(struct hfp_pvt *hfp, char *buf)
 }
 
 /*
- * Bluetooth Headset Profile helpers
- */
-
-/*!
- * \brief Send an OK AT response.
- * \param rsock the rfcomm socket to use
- */
-static int hsp_send_ok(int rsock)
-{
-	return rfcomm_write(rsock, "\r\nOK\r\n");
-}
-
-/*!
- * \brief Send an ERROR AT response.
- * \param rsock the rfcomm socket to use
- */
-static int hsp_send_error(int rsock)
-{
-	return rfcomm_write(rsock, "\r\nERROR\r\n");
-}
-
-/*!
- * \brief Send a speaker gain unsolicited AT response
- * \param rsock the rfcomm socket to use
- * \param gain the speaker gain value
- */
-static int hsp_send_vgs(int rsock, int gain)
-{
-	char cmd[32];
-	snprintf(cmd, sizeof(cmd), "\r\n+VGS=%d\r\n", gain);
-	return rfcomm_write(rsock, cmd);
-}
-
-/*!
- * \brief Send a microphone gain unsolicited AT response
- * \param rsock the rfcomm socket to use
- * \param gain the microphone gain value
- */
-static int hsp_send_vgm(int rsock, int gain)
-{
-	char cmd[32];
-	snprintf(cmd, sizeof(cmd), "\r\n+VGM=%d\r\n", gain);
-	return rfcomm_write(rsock, cmd);
-}
-
-/*!
- * \brief Send a RING unsolicited AT response.
- * \param rsock the rfcomm socket to use
- */
-static int hsp_send_ring(int rsock)
-{
-	return rfcomm_write(rsock, "\r\nRING\r\n");
-}
-
-/*
  * message queue functions
  */
 
@@ -5001,7 +4897,7 @@ static sdp_session_t *sdp_register(void)
 	sdp_set_service_id(record, svc_uuid);
 
 	sdp_uuid32_create(&svc_class1_uuid, GENERIC_AUDIO_SVCLASS_ID);
-	sdp_uuid32_create(&svc_class2_uuid, HEADSET_PROFILE_ID);
+	sdp_uuid32_create(&svc_class2_uuid, HANDSFREE_PROFILE_ID);
 
 	svc_uuid_list = sdp_list_append(0, &svc_class1_uuid);
 	svc_uuid_list = sdp_list_append(svc_uuid_list, &svc_class2_uuid);
@@ -8755,9 +8651,8 @@ e_cleanup:
 			pvt->profile_incompatible = 1;
 			mbl_set_state(pvt, MBL_STATE_ERROR);
 			ast_log(LOG_WARNING, "[%s] HFP initialization failed %d times. "
-				"Device does not support Hands-Free Profile properly. "
-				"This may be a legacy device that only supports HSP (Headset Profile) "
-				"or has incompatible HFP implementation. Will not retry connection.\n",
+				"Device does not support Hands-Free Profile properly, "
+				"or has an incompatible HFP implementation. Will not retry connection.\n",
 				pvt->id, pvt->hfp_init_fail_count);
 		} else {
 			ast_verb(3, "[%s] HFP initialization failed (attempt %d/2), will retry...\n",
@@ -8804,23 +8699,6 @@ e_cleanup:
 	return NULL;
 }
 
-static int headset_send_ring(const void *data)
-{
-	struct mbl_pvt *pvt = (struct mbl_pvt *) data;
-	ast_mutex_lock(&pvt->lock);
-	if (!pvt->needring) {
-		ast_mutex_unlock(&pvt->lock);
-		return 0;
-	}
-	ast_mutex_unlock(&pvt->lock);
-
-	if (hsp_send_ring(pvt->rfcomm_socket)) {
-		ast_debug(1, "[%s] error sending RING\n", pvt->id);
-		return 0;
-	}
-	return 1;
-}
-
 /*!
  * \brief Periodic status polling callback
  * Queries battery status and registration when device is idle
@@ -8857,169 +8735,14 @@ static int mbl_status_poll(const void *data)
 	return 1;  /* Reschedule */
 }
 
-static void *do_monitor_headset(void *data)
-{
-
-	struct mbl_pvt *pvt = (struct mbl_pvt *)data;
-	char buf[256];
-	int t;
-	enum at_message at_msg;
-	struct ast_channel *chan = NULL;
-
-	ast_verb(3, "Bluetooth Device %s initialised and ready.\n", pvt->id);
-
-	while (!check_unloading()) {
-
-		t = ast_sched_wait(pvt->sched);
-		if (t == -1) {
-			t = 6000;
-		}
-
-		ast_sched_runq(pvt->sched);
-
-		if (rfcomm_wait(pvt->rfcomm_socket, &t) == 0) {
-			continue;
-		}
-
-		if ((at_msg = at_read_full(pvt->rfcomm_socket, buf, sizeof(buf))) < 0) {
-			ast_debug(1, "[%s] error reading from device: %s (%d)\n", pvt->id, strerror(errno), errno);
-			goto e_cleanup;
-		}
-		ast_debug(1, "[%s] %s\n", pvt->id, buf);
-
-		switch (at_msg) {
-		case AT_VGS:
-		case AT_VGM:
-			/* XXX volume change requested, we will just
-			 * pretend to do something with it */
-			if (hsp_send_ok(pvt->rfcomm_socket)) {
-				ast_debug(1, "[%s] error sending AT message 'OK'\n", pvt->id);
-				goto e_cleanup;
-			}
-			break;
-		case AT_CKPD:
-			ast_mutex_lock(&pvt->lock);
-			if (pvt->outgoing) {
-				pvt->needring = 0;
-				hsp_send_ok(pvt->rfcomm_socket);
-				if (pvt->answered) {
-					/* we have an answered call up to the
-					 * HS, he wants to hangup */
-					mbl_queue_hangup(pvt);
-				} else {
-					/* we have an outgoing call to the HS,
-					 * he wants to answer */
-					if ((pvt->sco_socket = sco_connect(pvt->adapter->addr, pvt->addr, &pvt->sco_mtu)) == -1) {
-						ast_log(LOG_ERROR, "[%s] unable to create audio connection\n", pvt->id);
-						mbl_queue_hangup(pvt);
-						ast_mutex_unlock(&pvt->lock);
-						goto e_cleanup;
-					}
-
-					/* Reset smoother to use negotiated MTU */
-					ast_smoother_reset(pvt->bt_out_smoother, pvt->sco_mtu);
-
-					ast_channel_set_fd(pvt->owner, 0, pvt->sco_socket);
-
-					mbl_queue_control(pvt, AST_CONTROL_ANSWER);
-					pvt->answered = 1;
-
-					if (hsp_send_vgs(pvt->rfcomm_socket, 13) || hsp_send_vgm(pvt->rfcomm_socket, 13)) {
-						ast_debug(1, "[%s] error sending VGS/VGM\n", pvt->id);
-						mbl_queue_hangup(pvt);
-						ast_mutex_unlock(&pvt->lock);
-						goto e_cleanup;
-					}
-				}
-			} else if (pvt->incoming) {
-				/* we have an incoming call from the
-				 * HS, he wants to hang up */
-				mbl_queue_hangup(pvt);
-			} else {
-				/* no call is up, HS wants to dial */
-				hsp_send_ok(pvt->rfcomm_socket);
-
-				if ((pvt->sco_socket = sco_connect(pvt->adapter->addr, pvt->addr, &pvt->sco_mtu)) == -1) {
-					ast_log(LOG_ERROR, "[%s] unable to create audio connection\n", pvt->id);
-					ast_mutex_unlock(&pvt->lock);
-					goto e_cleanup;
-				}
-
-				/* Reset smoother to use negotiated MTU */
-				ast_smoother_reset(pvt->bt_out_smoother, pvt->sco_mtu);
-
-				pvt->incoming = 1;
-
-				if (!(chan = mbl_new(AST_STATE_UP, pvt, NULL, NULL, NULL))) {
-					ast_log(LOG_ERROR, "[%s] unable to allocate channel for incoming call\n", pvt->id);
-					ast_mutex_unlock(&pvt->lock);
-					goto e_cleanup;
-				}
-
-				ast_channel_set_fd(chan, 0, pvt->sco_socket);
-
-				ast_channel_exten_set(chan, "s");
-				if (ast_pbx_start(chan)) {
-					ast_log(LOG_ERROR, "[%s] unable to start pbx on incoming call\n", pvt->id);
-					ast_hangup(chan);
-					ast_mutex_unlock(&pvt->lock);
-					goto e_cleanup;
-				}
-			}
-			ast_mutex_unlock(&pvt->lock);
-			break;
-		default:
-			ast_debug(1, "[%s] received unknown AT command: %s (%s)\n", pvt->id, buf, at_msg2str(at_msg));
-			if (hsp_send_error(pvt->rfcomm_socket)) {
-				ast_debug(1, "[%s] error sending AT message 'ERROR'\n", pvt->id);
-				goto e_cleanup;
-			}
-			break;
-		}
-	}
-
-e_cleanup:
-	ast_mutex_lock(&pvt->lock);
-	if (pvt->owner) {
-		ast_debug(1, "[%s] device disconnected, hanging up owner\n", pvt->id);
-		mbl_queue_hangup(pvt);
-	}
-
-	close(pvt->rfcomm_socket);
-	close(pvt->sco_socket);
-	pvt->sco_socket = -1;
-
-	pvt->connected = 0;
-
-	pvt->needring = 0;
-	pvt->outgoing = 0;
-	pvt->incoming = 0;
-
-	pvt->adapter->inuse = 0;
-	ast_mutex_unlock(&pvt->lock);
-
-	manager_event(EVENT_FLAG_SYSTEM, "MobileStatus", "Status: Disconnect\r\nDevice: %s\r\n", pvt->id);
-	ast_verb(3, "Bluetooth Device %s has disconnected\n", pvt->id);
-
-	return NULL;
-
-}
-
 static int start_monitor(struct mbl_pvt *pvt)
 {
 
-	if (pvt->type == MBL_TYPE_PHONE) {
-		pvt->hfp->rsock = pvt->rfcomm_socket;
+	pvt->hfp->rsock = pvt->rfcomm_socket;
 
-		if (ast_pthread_create_background(&pvt->monitor_thread, NULL, do_monitor_phone, pvt) < 0) {
-			pvt->monitor_thread = AST_PTHREADT_NULL;
-			return 0;
-		}
-	} else {
-		if (ast_pthread_create_background(&pvt->monitor_thread, NULL, do_monitor_headset, pvt) < 0) {
-			pvt->monitor_thread = AST_PTHREADT_NULL;
-			return 0;
-		}
+	if (ast_pthread_create_background(&pvt->monitor_thread, NULL, do_monitor_phone, pvt) < 0) {
+		pvt->monitor_thread = AST_PTHREADT_NULL;
+		return 0;
 	}
 
 	return 1;
@@ -9286,25 +9009,15 @@ static void *do_discovery(void *data)
 					int detected_port;
 					ba2str(&pvt->addr, addr_str);
 					
-					ast_debug(1, "Detecting port for %s (type=%s)\n", pvt->id,
-						pvt->type == MBL_TYPE_HEADSET ? "headset" : "phone");
+					ast_debug(1, "Detecting port for %s\n", pvt->id);
 					
-					if (pvt->type == MBL_TYPE_HEADSET) {
-						detected_port = sdp_search(addr_str, HEADSET_PROFILE_ID);
-					} else {
-						detected_port = sdp_search(addr_str, HANDSFREE_AGW_PROFILE_ID);
-					}
+					detected_port = sdp_search(addr_str, HANDSFREE_AGW_PROFILE_ID);
 					
 					if (detected_port > 0) {
 						ast_verb(3, "Auto-detected port %d for device %s\n", detected_port, pvt->id);
 						pvt->rfcomm_port = detected_port;
 						pvt->sdp_fail_count = 0;
-						/* Set profile name based on type */
-						if (pvt->type == MBL_TYPE_HEADSET) {
-							ast_copy_string(pvt->profile_name, "HSP", sizeof(pvt->profile_name));
-						} else {
-							ast_copy_string(pvt->profile_name, "HFP", sizeof(pvt->profile_name));
-						}
+						ast_copy_string(pvt->profile_name, "HFP", sizeof(pvt->profile_name));
 					} else if (detected_port == -1) {
 						/* Transient error (device unreachable) - don't count as profile failure */
 						ast_debug(1, "[%s] Device unreachable (transient error), will retry...\n", pvt->id);
@@ -9315,17 +9028,9 @@ static void *do_discovery(void *data)
 							/* Print helpful message and mark as incompatible */
 							pvt->profile_incompatible = 1;
 							mbl_set_state(pvt, MBL_STATE_ERROR);
-							if (pvt->type == MBL_TYPE_HEADSET) {
-								ast_log(LOG_WARNING, "[%s] Device does not support Headset Profile (HS role, UUID 0x1108). "
-									"This device may only support Audio Gateway (AG) roles. "
-									"A Bluetooth headset must expose the HS or HF profile, not the AG profile. "
-									"Will not retry connection.\n", pvt->id);
-						} else {
 							ast_log(LOG_WARNING, "[%s] Device does not support Hands-Free AG Profile (UUID 0x111f). "
 								"A mobile phone must expose the Audio Gateway (AG) role for HFP. "
-								"If this is a headset, set type=headset in mobile.conf. "
 								"Will not retry connection.\n", pvt->id);
-								}
 						} else {
 							ast_debug(1, "Port detection failed for %s (attempt %d/3)\n", pvt->id, pvt->sdp_fail_count);
 						}
@@ -9619,14 +9324,6 @@ static struct mbl_pvt *mbl_load_device(struct ast_config *cfg, const char *cat)
 	pvt->type = MBL_TYPE_PHONE;
 	ast_copy_string(pvt->context, "default", sizeof(pvt->context));
 
-	/* Parse type early - needed for SDP profile selection */
-	{
-		const char *type_str = ast_variable_retrieve(cfg, cat, "type");
-		if (type_str && !strcasecmp(type_str, "headset")) {
-			pvt->type = MBL_TYPE_HEADSET;
-		}
-	}
-
 	/* populate the pvt structure */
 	pvt->adapter = adapter;
 	ast_copy_string(pvt->id, cat, sizeof(pvt->id));
@@ -9643,37 +9340,17 @@ static struct mbl_pvt *mbl_load_device(struct ast_config *cfg, const char *cat)
 
 		/* Only try SDP if adapter is ready */
 		if (adapter->state == ADAPTER_STATE_READY || adapter->state == ADAPTER_STATE_BUSY) {
-			/* Search based on device type - no fallback between profiles */
-			if (pvt->type == MBL_TYPE_HEADSET) {
-				/* Headset: search for HSP */
-				detected_port = sdp_search(addr_str, HEADSET_PROFILE_ID);
-				if (detected_port > 0) {
-					ast_log(LOG_NOTICE, "[%s] Auto-detected HSP port %d\n", cat, detected_port);
-					pvt->rfcomm_port = detected_port;
-					ast_copy_string(pvt->profile_name, "HSP", sizeof(pvt->profile_name));
-				} else if (detected_port == -1) {
-					ast_log(LOG_NOTICE, "[%s] Device not reachable, will retry when available.\n", cat);
-					pvt->rfcomm_port = 0;
-				} else {
-					ast_log(LOG_WARNING, "[%s] Headset does not support HSP. Check device.\n", cat);
-					pvt->rfcomm_port = 0;
-				}
+			detected_port = sdp_search(addr_str, HANDSFREE_AGW_PROFILE_ID);
+			if (detected_port > 0) {
+				ast_log(LOG_NOTICE, "[%s] Auto-detected HFP port %d\n", cat, detected_port);
+				pvt->rfcomm_port = detected_port;
+				ast_copy_string(pvt->profile_name, "HFP", sizeof(pvt->profile_name));
+			} else if (detected_port == -1) {
+				ast_log(LOG_NOTICE, "[%s] Device not reachable, will retry when available.\n", cat);
+				pvt->rfcomm_port = 0;
 			} else {
-				/* Phone: search for HFP only (no HSP fallback) */
-				detected_port = sdp_search(addr_str, HANDSFREE_AGW_PROFILE_ID);
-				if (detected_port > 0) {
-					ast_log(LOG_NOTICE, "[%s] Auto-detected HFP port %d\n", cat, detected_port);
-					pvt->rfcomm_port = detected_port;
-					pvt->type = MBL_TYPE_PHONE;
-					ast_copy_string(pvt->profile_name, "HFP", sizeof(pvt->profile_name));
-				} else if (detected_port == -1) {
-					ast_log(LOG_NOTICE, "[%s] Device not reachable, will retry when available.\n", cat);
-					pvt->rfcomm_port = 0;
-				} else {
-					ast_log(LOG_WARNING, "[%s] Phone does not support HFP. "
-							"If this is a headset, set type=headset in mobile.conf.\n", cat);
-					pvt->rfcomm_port = 0;
-				}
+				ast_log(LOG_WARNING, "[%s] Phone does not support HFP. Check device.\n", cat);
+				pvt->rfcomm_port = 0;
 			}
 		} else {
 			/* Adapter not ready, defer port detection */
@@ -9682,12 +9359,8 @@ static struct mbl_pvt *mbl_load_device(struct ast_config *cfg, const char *cat)
 		}
 	} else {
 		pvt->rfcomm_port = atoi(port);
-		/* Default to HFP when port is manually specified for phones */
-		if (pvt->type == MBL_TYPE_PHONE) {
-			ast_copy_string(pvt->profile_name, "HFP", sizeof(pvt->profile_name));
-		} else {
-			ast_copy_string(pvt->profile_name, "HSP", sizeof(pvt->profile_name));
-		}
+		/* Default to HFP when port is manually specified */
+		ast_copy_string(pvt->profile_name, "HFP", sizeof(pvt->profile_name));
 	}
 
 	pvt->state = MBL_STATE_INIT;
@@ -9720,7 +9393,7 @@ static struct mbl_pvt *mbl_load_device(struct ast_config *cfg, const char *cat)
 
 	/* setup the scheduler */
 	if (!(pvt->sched = ast_sched_context_create())) {
-		ast_log(LOG_ERROR, "Unable to create scheduler context for headset device\n");
+		ast_log(LOG_ERROR, "Unable to create scheduler context for device %s\n", cat);
 		goto e_free_dsp;
 	}
 
@@ -9728,14 +9401,7 @@ static struct mbl_pvt *mbl_load_device(struct ast_config *cfg, const char *cat)
 	ast_dsp_set_digitmode(pvt->dsp, DSP_DIGITMODE_DTMF | DSP_DIGITMODE_RELAXDTMF);
 
 	for (v = ast_variable_browse(cfg, cat); v; v = v->next) {
-		if (!strcasecmp(v->name, "type")) {
-			if (!strcasecmp(v->value, "headset")) {
-				pvt->type = MBL_TYPE_HEADSET;
-			}
-			else {
-				pvt->type = MBL_TYPE_PHONE;
-			}
-		} else if (!strcasecmp(v->name, "context")) {
+		if (!strcasecmp(v->name, "context")) {
 			ast_copy_string(pvt->context, v->value, sizeof(pvt->context));
 		} else if (!strcasecmp(v->name, "sms_delete_after_read")) {
 			pvt->sms_delete_after_read = ast_true(v->value);
@@ -9766,23 +9432,19 @@ static struct mbl_pvt *mbl_load_device(struct ast_config *cfg, const char *cat)
 		ast_copy_string(pvt->context, "default", sizeof(pvt->context));
 	}
 
-	if (pvt->type == MBL_TYPE_PHONE) {
-		if (!(pvt->hfp = ast_calloc(1, sizeof(*pvt->hfp)))) {
-			ast_log(LOG_ERROR, "Skipping device %s. Error allocating memory.\n", pvt->id);
-			goto e_free_sched;
-		}
-
-		pvt->hfp->owner = pvt;
-		pvt->hfp->rport = pvt->rfcomm_port;
-		pvt->hfp->nocallsetup = pvt->no_callsetup;
-		/* Initialize device status fields to unknown */
-		pvt->hfp->battery_percent = -1;
-		pvt->hfp->charging = -1;
-		pvt->hfp->creg = -1;
-		pvt->hfp->cgreg = -1;
-	} else {
-		pvt->sms_mode = SMS_MODE_OFF;  /* Headsets don't support SMS */
+	if (!(pvt->hfp = ast_calloc(1, sizeof(*pvt->hfp)))) {
+		ast_log(LOG_ERROR, "Skipping device %s. Error allocating memory.\n", pvt->id);
+		goto e_free_sched;
 	}
+
+	pvt->hfp->owner = pvt;
+	pvt->hfp->rport = pvt->rfcomm_port;
+	pvt->hfp->nocallsetup = pvt->no_callsetup;
+	/* Initialize device status fields to unknown */
+	pvt->hfp->battery_percent = -1;
+	pvt->hfp->charging = -1;
+	pvt->hfp->creg = -1;
+	pvt->hfp->cgreg = -1;
 
 	AST_RWLIST_WRLOCK(&devices);
 	AST_RWLIST_INSERT_HEAD(&devices, pvt, entry);
