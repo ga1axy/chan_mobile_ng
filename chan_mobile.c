@@ -169,6 +169,94 @@ static AST_RWLIST_HEAD_STATIC(adapters, adapter_pvt);
 
 struct msg_queue_entry;
 struct hfp_pvt;
+
+/*!
+ * \brief Per-call signaling state.
+ *
+ * Tracks the lifecycle of a single call attempt (incoming or outgoing):
+ * which direction it is, what AT-side signaling we still owe the device
+ * (RING, CHUP, caller id), and how it ended. Logically separate from the
+ * device/RFCOMM connection state and from SMS state.
+ */
+struct mbl_call_state {
+	bool outgoing;			/*!< outgoing call */
+	bool incoming;			/*!< incoming call */
+	bool needcallerid;		/*!< we need callerid */
+	bool needchup;			/*!< we need to send a chup */
+	bool needring;			/*!< we need to send a RING */
+	bool answered;			/*!< we sent/received an answer */
+	bool no_callsetup;		/*!< device has no callsetup indicator (mirrors hfp->nocallsetup) */
+	int hangup_cause;
+	int ring_scheduler_id;
+};
+
+/*!
+ * \brief AT+CNMI capability/selection storage.
+ *
+ * Holds the value sets reported by "AT+CNMI=?" and the combination we
+ * settled on, so SMS notification setup only has to be worked out once
+ * per device. Nested under mbl_sms_state since CNMI exists purely to
+ * configure new-SMS notifications.
+ */
+struct mbl_cnmi_config {
+	int8_t mode_vals[10];      /*!< Valid mode values from AT+CNMI=? */
+	int8_t mt_vals[10];        /*!< Valid mt values from AT+CNMI=? */
+	int8_t bm_vals[10];        /*!< Valid bm values from AT+CNMI=? */
+	int8_t ds_vals[10];        /*!< Valid ds values from AT+CNMI=? */
+	int8_t bfr_vals[10];       /*!< Valid bfr values from AT+CNMI=? */
+	int8_t selected[5];        /*!< Selected CNMI values [mode,mt,bm,ds,bfr] */
+	bool test_done; /*!< AT+CNMI=? query completed */
+};
+
+/*!
+ * \brief SMS protocol state.
+ *
+ * Everything to do with reading and sending text messages: operating
+ * mode, the read/send pipeline, and the CNMI configuration that drives
+ * unsolicited new-message notifications.
+ */
+struct mbl_sms_state {
+	enum sms_mode mode;				/*!< SMS operating mode */
+	bool has_utf8;    /*!< device supports UTF-8 charset */
+	bool has_ucs2;    /*!< device supports UCS2 charset (hex-encoded Unicode) */
+	bool has_gsm;     /*!< device supports GSM 7-bit charset */
+	bool has_ira;     /*!< device supports IRA (ASCII) charset */
+	bool utf8_candidate; /*!< device might support UTF-8 */
+	bool outgoing;		/*!< outgoing sms */
+	bool incoming;		/*!< incoming sms */
+	int index_to_read;      /*!< SMS index to read after storage selection */
+	char storage_pending[4]; /*!< Storage currently being set via CPMS */
+	bool delete_after_read; /*!< Delete SMS after reading */
+	int pending_indices[32]; /*!< Indices found by CMGL scan or CMTI queue */
+	int pending_count;       /*!< Number of pending indices */
+	int cmti_sched_id;       /*!< Scheduler ID for delayed CMTI read */
+	bool send_in_progress; /*!< SMS send is in progress - reject new sends */
+	struct mbl_cnmi_config cnmi; /*!< CNMI capability/selection storage */
+};
+
+/*!
+ * \brief SCO MTU / byte-alignment drift detection state.
+ *
+ * Some adapters change the eSCO packet size mid-call or let the audio
+ * stream drift out of byte alignment; this is the running sample
+ * history used to detect and correct for that.
+ */
+struct mbl_sco_align_state {
+	bool detect_sco_alignment;
+	bool alignment_detection_triggered;
+	short alignment_samples[4];
+	int alignment_count;
+	int mtu_change_count;				/*!< for detecting eSCO packet size changes */
+};
+
+/*!
+ * \brief Consecutive-failure counters used to back off / flag a device as unhealthy.
+ */
+struct mbl_health_state {
+	int sdp_fail_count;         /*!< count of consecutive SDP failures for profile detection */
+	int hfp_init_fail_count;    /*!< count of consecutive HFP initialization failures */
+};
+
 struct mbl_pvt {
 	struct ast_channel *owner;			/*!< Channel we belong to, possibly NULL */
 	struct ast_frame fr;				/*!< "null" frame */
@@ -193,60 +281,29 @@ struct mbl_pvt {
 	int sco_socket;					/*!< sco socket descriptor */
 	int sco_mtu;					/*!< negotiated SCO/eSCO packet size */
 	int lmp_version;					/*!< Remote Bluetooth Version (LMP) */
-	int sco_mtu_change_count;				/*!< for detecting eSCO packet size changes */
 	pthread_t monitor_thread;			/*!< monitor thread handle */
 	int timeout;					/*!< used to set the timeout for rfcomm data (may be used in the future) */
-	bool no_callsetup;
-	enum sms_mode sms_mode;				/*!< SMS operating mode */
-	bool detect_sco_alignment;
-	bool alignment_detection_triggered;
 	bool blackberry;
-	short alignment_samples[4];
-	int alignment_count;
-	int ring_scheduler_id;
 	int status_scheduler_id;			/*!\< scheduler ID for periodic status polling */
 	struct ast_dsp *dsp;
 	struct ast_sched_context *sched;
-	int hangup_cause;
 
 	/* flags */
-	bool outgoing;			/*!< outgoing call */
-	bool incoming;			/*!< incoming call */
-	bool outgoing_sms;		/*!< outgoing sms */
-	bool incoming_sms;		/*!< incoming sms */
-	bool needcallerid;		/*!< we need callerid */
-	bool needchup;			/*!< we need to send a chup */
-	bool needring;			/*!< we need to send a RING */
-	bool answered;			/*!< we sent/received an answer */
 	bool connected;			/*!< do we have an rfcomm connection to a device */
-	bool has_utf8;    /*!< device supports UTF-8 charset */
-	bool has_ucs2;    /*!< device supports UCS2 charset (hex-encoded Unicode) */
-	bool has_gsm;     /*!< device supports GSM 7-bit charset */
-	bool has_ira;     /*!< device supports IRA (ASCII) charset */
-	bool utf8_candidate; /*!< device might support UTF-8 */
 	bool profile_incompatible; /*!< device lacks required HS/HF profile */
 	char cscs_active[16];       /*!< currently active charset */
 	char cscs_list[128];        /*!< raw list of supported charsets from AT+CSCS=? */
-	int sdp_fail_count;         /*!< count of consecutive SDP failures for profile detection */
-	int hfp_init_fail_count;    /*!< count of consecutive HFP initialization failures */
 	bdaddr_t last_checked_addr; /*!< last address we tried to connect - for detecting config changes */
 
-	int sms_index_to_read;      /*!< SMS index to read after storage selection */
-	char sms_storage_pending[4]; /*!< Storage currently being set via CPMS */
-	bool sms_delete_after_read; /*!< Delete SMS after reading */
-	int sms_pending_indices[32]; /*!< Indices found by CMGL scan or CMTI queue */
-	int sms_pending_count;       /*!< Number of pending indices */
-	int sms_cmti_sched_id;       /*!< Scheduler ID for delayed CMTI read */
-	bool sms_send_in_progress; /*!< SMS send is in progress - reject new sends */
-
-	/* CNMI smart configuration storage */
-	int8_t cnmi_mode_vals[10];      /*!< Valid mode values from AT+CNMI=? */
-	int8_t cnmi_mt_vals[10];        /*!< Valid mt values from AT+CNMI=? */
-	int8_t cnmi_bm_vals[10];        /*!< Valid bm values from AT+CNMI=? */
-	int8_t cnmi_ds_vals[10];        /*!< Valid ds values from AT+CNMI=? */
-	int8_t cnmi_bfr_vals[10];       /*!< Valid bfr values from AT+CNMI=? */
-	int8_t cnmi_selected[5];        /*!< Selected CNMI values [mode,mt,bm,ds,bfr] */
-	bool cnmi_test_done; /*!< AT+CNMI=? query completed */
+	/*
+	 * Previously ~35 flat fields mixing call/SMS/CNMI/SCO-alignment/failure
+	 * concerns lived directly on mbl_pvt (the "God Object" issue). They are
+	 * now grouped into the dedicated structs defined above this struct.
+	 */
+	struct mbl_call_state call;		/*!< per-call signaling state */
+	struct mbl_sms_state sms;		/*!< SMS protocol state (incl. CNMI config) */
+	struct mbl_sco_align_state sco_align;	/*!< SCO MTU/alignment-drift detection state */
+	struct mbl_health_state health;	/*!< consecutive failure counters */
 
 	AST_LIST_ENTRY(mbl_pvt) entry;
 };
@@ -567,7 +624,19 @@ struct hfp_cind {
  * \brief This struct holds state information about the current hfp connection.
  */
 struct hfp_pvt {
-	struct mbl_pvt *owner;		/*!< the mbl_pvt struct that owns this struct */
+	/*!
+	 * \brief Non-owning back-reference to the mbl_pvt that allocated us.
+	 *
+	 * Lifetime: exactly one mbl_pvt allocates exactly one hfp_pvt (see
+	 * mbl_load_device()/cleanup) and frees it before freeing itself, so
+	 * \a owner is valid for the entire lifetime of this struct and must
+	 * never be freed from here. This back-pointer (mirrored by
+	 * mbl_pvt::hfp) is a deliberate parent/child link, not a place to
+	 * stash unrelated state -- call/SMS/CNMI data live on mbl_pvt's own
+	 * call/sms members, not here, specifically to avoid this pointer
+	 * turning into a second copy of the God Object.
+	 */
+	struct mbl_pvt *owner;
 	bool initialized;		/*!< whether a service level connection exists or not */
 	bool nocallsetup;		/*!< whether we detected a callsetup indicator */
 	struct hfp_ag ag_features;	/*!< the supported feature set of the AG */
@@ -916,7 +985,7 @@ static char *handle_cli_mobile_show_devices(struct ast_cli_entry *e, int cmd, st
 		}
 
 		/* SMS status */
-		ast_copy_string(sms_status, sms_mode_to_str(pvt->sms_mode), sizeof(sms_status));
+		ast_copy_string(sms_status, sms_mode_to_str(pvt->sms.mode), sizeof(sms_status));
 
 		/* Encoding */
 		ast_copy_string(encoding, pvt->cscs_active[0] ? pvt->cscs_active : "Default", sizeof(encoding));
@@ -1081,7 +1150,7 @@ static char *handle_cli_mobile_show_device(struct ast_cli_entry *e, int cmd, str
 	}
 
 	/* SMS and charset capabilities */
-	ast_cli(a->fd, "SMS Support: %s\n", sms_mode_to_str(pvt->sms_mode));
+	ast_cli(a->fd, "SMS Support: %s\n", sms_mode_to_str(pvt->sms.mode));
 	ast_cli(a->fd, "Active Charset: %s\n", pvt->cscs_active[0] ? pvt->cscs_active : "-");
 	ast_cli(a->fd, "Supported Charsets: %s\n", pvt->cscs_list[0] ? pvt->cscs_list : "-");
 
@@ -1691,7 +1760,7 @@ static int mbl_sendsms_exec(struct ast_channel *ast, const char *data)
 		goto e_unlock_pvt;
 	}
 
-	if (pvt->sms_mode < SMS_MODE_TEXT) {
+	if (pvt->sms.mode < SMS_MODE_TEXT) {
 		ast_log(LOG_ERROR, "Bluetooth device %s doesn't handle SMS -- SMS will not be sent.\n", args.device);
 		goto e_unlock_pvt;
 	}
@@ -1726,10 +1795,10 @@ static struct ast_channel *mbl_new(int state, struct mbl_pvt *pvt, struct cidinf
 {
 	struct ast_channel *chn;
 
-	pvt->answered = false;
-	pvt->alignment_count = 0;
-	pvt->alignment_detection_triggered = false;
-	pvt->detect_sco_alignment = pvt->adapter->alignment_detection;
+	pvt->call.answered = false;
+	pvt->sco_align.alignment_count = 0;
+	pvt->sco_align.alignment_detection_triggered = false;
+	pvt->sco_align.detect_sco_alignment = pvt->adapter->alignment_detection;
 
 	ast_smoother_reset(pvt->sco_output_smoother, pvt->sco_mtu);
 	ast_smoother_reset(pvt->sco_input_smoother, CHANNEL_FRAME_SIZE);
@@ -1872,8 +1941,8 @@ static int mbl_call(struct ast_channel *ast, const char *dest, int timeout)
 		ast_log(LOG_ERROR, "error sending ATD command on %s\n", pvt->id);
 		return -1;
 	}
-	pvt->hangup_cause = 0;
-	pvt->needchup = true;
+	pvt->call.hangup_cause = 0;
+	pvt->call.needchup = true;
 	msg_queue_push(pvt, AT_OK, AT_D);
 	ast_mutex_unlock(&pvt->lock);
 
@@ -1898,15 +1967,15 @@ static int mbl_hangup(struct ast_channel *ast)
 	close(pvt->sco_socket);
 	pvt->sco_socket = -1;
 
-	if (pvt->needchup) {
+	if (pvt->call.needchup) {
 		hfp_send_chup(pvt->hfp);
 		msg_queue_push(pvt, AT_OK, AT_CHUP);
-		pvt->needchup = false;
+		pvt->call.needchup = false;
 	}
 
-	pvt->outgoing = false;
-	pvt->incoming = false;
-	pvt->needring = false;
+	pvt->call.outgoing = false;
+	pvt->call.incoming = false;
+	pvt->call.needring = false;
 	pvt->owner = NULL;
 	ast_channel_tech_pvt_set(ast, NULL);
 
@@ -1925,10 +1994,10 @@ static int mbl_answer(struct ast_channel *ast)
 	pvt = ast_channel_tech_pvt(ast);
 
 	ast_mutex_lock(&pvt->lock);
-	if (pvt->incoming) {
+	if (pvt->call.incoming) {
 		hfp_send_ata(pvt->hfp);
 		msg_queue_push(pvt, AT_OK, AT_A);
-		pvt->answered = true;
+		pvt->call.answered = true;
 	}
 	ast_mutex_unlock(&pvt->lock);
 
@@ -1993,7 +2062,7 @@ static struct ast_frame *mbl_read(struct ast_channel *ast)
 		pvt->fr.samples = r / 2;
 
 		/* Log first packet and MTU mismatches for debugging */
-		if (pvt->sco_mtu_change_count == 0 && r > 0) {
+		if (pvt->sco_align.mtu_change_count == 0 && r > 0) {
 			/* First packet after reset or if sizes match */
 			if (r != pvt->sco_mtu) {
 				ast_log(LOG_NOTICE, "[%s] SCO packet size mismatch: got %d bytes, expected MTU=%d (HV3=48, HV2=30, HV1=10)\n",
@@ -2002,21 +2071,21 @@ static struct ast_frame *mbl_read(struct ast_channel *ast)
 		}
 
 		if (r > 0 && r != pvt->sco_mtu) {
-			pvt->sco_mtu_change_count++;
-			if (pvt->sco_mtu_change_count == 1) {
+			pvt->sco_align.mtu_change_count++;
+			if (pvt->sco_align.mtu_change_count == 1) {
 				ast_debug(1, "[%s] SCO MTU mismatch #1: received=%d, expected=%d\n", pvt->id, r, pvt->sco_mtu);
-			} else if (pvt->sco_mtu_change_count > 10) {
+			} else if (pvt->sco_align.mtu_change_count > 10) {
 				ast_log(LOG_NOTICE, "[%s] Adjusting SCO MTU from %d to %d based on incoming packets (phone uses fixed packet size)\n",
 					pvt->id, pvt->sco_mtu, r);
 				pvt->sco_mtu = r;
 				ast_smoother_reset(pvt->sco_output_smoother, pvt->sco_mtu);
-				pvt->sco_mtu_change_count = 0;
+				pvt->sco_align.mtu_change_count = 0;
 			}
 		} else {
-			pvt->sco_mtu_change_count = 0;
+			pvt->sco_align.mtu_change_count = 0;
 		}
 
-		if (pvt->detect_sco_alignment) {
+		if (pvt->sco_align.detect_sco_alignment) {
 			detect_sco_alignment(pvt, pvt->fr.data.ptr, r);
 		}
 
@@ -2139,7 +2208,7 @@ static int mbl_devicestate(const char *data)
 
 static void detect_sco_alignment(struct mbl_pvt *pvt, char *buf, int buflen)
 {
-	if (pvt->alignment_detection_triggered) {
+	if (pvt->sco_align.alignment_detection_triggered) {
 		/* Shift buffer contents one byte to the right to compensate. */
 		for (char *p = buf + buflen - 1; p > buf; p--) {
 			*p = *(p - 1);
@@ -2148,30 +2217,30 @@ static void detect_sco_alignment(struct mbl_pvt *pvt, char *buf, int buflen)
 		return;
 	}
 
-	if (pvt->alignment_count < 4) {
+	if (pvt->sco_align.alignment_count < 4) {
 		const short *s = (const short *)buf;
 		short a = 0;
 		for (int i = 0; i < buflen / 2; i++) {
 			a += *s++;
 			a /= i + 1;
 		}
-		pvt->alignment_samples[pvt->alignment_count++] = a;
+		pvt->sco_align.alignment_samples[pvt->sco_align.alignment_count++] = a;
 		return;
 	}
 
 	ast_debug(1, "Alignment Detection result is [%d %d %d %d]\n",
-		pvt->alignment_samples[0], pvt->alignment_samples[1],
-		pvt->alignment_samples[2], pvt->alignment_samples[3]);
+		pvt->sco_align.alignment_samples[0], pvt->sco_align.alignment_samples[1],
+		pvt->sco_align.alignment_samples[2], pvt->sco_align.alignment_samples[3]);
 
 	{
-		short a = (short)(abs(pvt->alignment_samples[1])
-			+ abs(pvt->alignment_samples[2])
-			+ abs(pvt->alignment_samples[3])) / 3;
+		short a = (short)(abs(pvt->sco_align.alignment_samples[1])
+			+ abs(pvt->sco_align.alignment_samples[2])
+			+ abs(pvt->sco_align.alignment_samples[3])) / 3;
 		if (a > 100) {
-			pvt->alignment_detection_triggered = true;
+			pvt->sco_align.alignment_detection_triggered = true;
 			ast_debug(1, "Alignment Detection Triggered.\n");
 		} else {
-			pvt->detect_sco_alignment = false;
+			pvt->sco_align.detect_sco_alignment = false;
 		}
 	}
 }
@@ -2201,8 +2270,8 @@ static int mbl_queue_hangup(struct mbl_pvt *pvt)
 			if (ast_channel_trylock(pvt->owner)) {
 				DEADLOCK_AVOIDANCE(&pvt->lock);
 			} else {
-				if (pvt->hangup_cause != 0) {
-					ast_channel_hangupcause_set(pvt->owner, pvt->hangup_cause);
+				if (pvt->call.hangup_cause != 0) {
+					ast_channel_hangupcause_set(pvt->owner, pvt->call.hangup_cause);
 				}
 				ast_queue_hangup(pvt->owner);
 				ast_channel_unlock(pvt->owner);
@@ -2350,7 +2419,7 @@ static int rfcomm_write_all(int rfcomm_sock, const char *buf, size_t count)
 	ssize_t out_count;
 
 	ast_debug(1, "rfcomm_write() (%d) [%.*s]\n", rfcomm_sock, (int) count, buf);
-	ast_verb(3, "AT-> %.*s\n", (int) count, buf);
+	ast_verb(3, "AT----------------> %.*s\n", (int) count, buf);
 	while (count > 0) {
 		if ((out_count = write(rfcomm_sock, p, count)) == -1) {
 			ast_debug(1, "rfcomm_write() error [%d]\n", errno);
@@ -3479,7 +3548,7 @@ static struct cidinfo hfp_parse_clip(struct hfp_pvt *hfp, char *buf)
 	}
 
 	/* Only filter if we haven't confirmed UTF-8 support (or using UCS-2 which is effectively UTF-8 capable) */
-	if (!hfp->owner->has_utf8 && !hfp->owner->has_ucs2) {
+	if (!hfp->owner->sms.has_utf8 && !hfp->owner->sms.has_ucs2) {
 		for (cnamtmp = cidinfo.cnam; *cnamtmp != '\0'; cnamtmp++) {
 			if (!strchr("ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789-,abcdefghijklmnopqrstuvwxyz_", *cnamtmp)) {
 				*cnamtmp = '_';	/* Invalid.  Replace with underscore. */
@@ -3794,7 +3863,7 @@ static int hfp_send_cmgl(struct hfp_pvt *hfp, const char *status)
 {
 	char cmd[64];
 	/* Check if we're in PDU mode - if owner has pdu mode, use numeric status */
-	if (hfp->owner && hfp->owner->sms_mode == SMS_MODE_PDU) {
+	if (hfp->owner && hfp->owner->sms.mode == SMS_MODE_PDU) {
 		/* Convert text status to PDU numeric: 0=unread, 1=read, 4=all */
 		int num_status = 4;  /* default to ALL */
 		if (!strcmp(status, "REC UNREAD")) {
@@ -4660,7 +4729,7 @@ static int hfp_parse_cind_test(struct hfp_pvt *hfp, char *buf)
 		}
 	}
 
-	hfp->owner->no_callsetup = hfp->nocallsetup;
+	hfp->owner->call.no_callsetup = hfp->nocallsetup;
 
 	return 0;
 }
@@ -4994,7 +5063,7 @@ static int handle_response_ok(struct mbl_pvt *pvt, char *buf)
 			break;
 		case AT_CSCS:
 			/* Select best charset in priority order: UTF-8 > UCS2 > GSM */
-			if (pvt->has_utf8 && !pvt->cscs_active[0]) {
+			if (pvt->sms.has_utf8 && !pvt->cscs_active[0]) {
 				ast_debug(1, "[%s] Charsets: %s\n", pvt->id, pvt->cscs_list);
 				ast_debug(1, "[%s] Selecting UTF-8 charset\n", pvt->id);
 				if (hfp_send_cscs(pvt->hfp, "UTF-8") || msg_queue_push(pvt, AT_OK, AT_CSCS_SET)) {
@@ -5003,7 +5072,7 @@ static int handle_response_ok(struct mbl_pvt *pvt, char *buf)
 				}
 				ast_copy_string(pvt->cscs_active, "UTF-8", sizeof(pvt->cscs_active));
 				break;
-			} else if (pvt->has_ucs2 && !pvt->cscs_active[0]) {
+			} else if (pvt->sms.has_ucs2 && !pvt->cscs_active[0]) {
 				ast_debug(1, "[%s] Charsets: %s\n", pvt->id, pvt->cscs_list);
 				ast_debug(1, "[%s] Selecting UCS2 charset (Unicode with hex encoding)\n", pvt->id);
 				if (hfp_send_cscs(pvt->hfp, "UCS2") || msg_queue_push(pvt, AT_OK, AT_CSCS_SET)) {
@@ -5012,7 +5081,7 @@ static int handle_response_ok(struct mbl_pvt *pvt, char *buf)
 				}
 				ast_copy_string(pvt->cscs_active, "UCS2", sizeof(pvt->cscs_active));
 				break;
-			} else if (pvt->has_gsm && !pvt->cscs_active[0]) {
+			} else if (pvt->sms.has_gsm && !pvt->cscs_active[0]) {
 				/* Explicitly set GSM to ensure consistent behavior */
 				ast_debug(1, "[%s] Charsets: %s\n", pvt->id, pvt->cscs_list);
 				ast_debug(1, "[%s] Selecting GSM 7-bit charset\n", pvt->id);
@@ -5030,10 +5099,10 @@ static int handle_response_ok(struct mbl_pvt *pvt, char *buf)
 		case AT_CSCS_VERIFY:
 			ast_verb(3, "[%s] Charset: %s (supported: %s%s%s%s)\n",
 				pvt->id, pvt->cscs_active,
-				pvt->has_utf8 ? "UTF-8 " : "",
-				pvt->has_ucs2 ? "UCS2 " : "",
-				pvt->has_gsm ? "GSM " : "",
-				pvt->has_ira ? "IRA " : "");
+				pvt->sms.has_utf8 ? "UTF-8 " : "",
+				pvt->sms.has_ucs2 ? "UCS2 " : "",
+				pvt->sms.has_gsm ? "GSM " : "",
+				pvt->sms.has_ira ? "IRA " : "");
 			/* Fall through to CIND */
 		case AT_CSCS_SET:
 			if (entry->response_to == AT_CSCS_SET) {
@@ -5142,7 +5211,7 @@ static int handle_response_ok(struct mbl_pvt *pvt, char *buf)
 			ast_debug(1, "[%s] volume level synchronization successful\n", pvt->id);
 
 			/* Try to set SMS operating mode - text mode first */
-			if (pvt->sms_mode != SMS_MODE_OFF) {
+			if (pvt->sms.mode != SMS_MODE_OFF) {
 				ast_debug(1, "[%s] SMS: attempting to enable text mode (AT+CMGF=1)\n", pvt->id);
 				if (hfp_send_cmgf(pvt->hfp, 1) || msg_queue_push(pvt, AT_OK, AT_CMGF)) {
 					ast_debug(1, "[%s] error setting CMGF\n", pvt->id);
@@ -5152,7 +5221,7 @@ static int handle_response_ok(struct mbl_pvt *pvt, char *buf)
 			break;
 		case AT_CMGF:
 			ast_debug(1, "[%s] SMS: text mode (AT+CMGF=1) accepted\n", pvt->id);
-			pvt->sms_mode = SMS_MODE_TEXT;
+			pvt->sms.mode = SMS_MODE_TEXT;
 			/* turn on SMS new message indication */
 			ast_debug(1, "[%s] SMS: enabling new message notifications (AT+CNMI)\n", pvt->id);
 			if (hfp_send_cnmi(pvt->hfp, 0) || msg_queue_push(pvt, AT_OK, AT_CNMI)) {
@@ -5162,7 +5231,7 @@ static int handle_response_ok(struct mbl_pvt *pvt, char *buf)
 			break;
 		case AT_CMGF_PDU:
 			ast_debug(1, "[%s] SMS: PDU mode (AT+CMGF=0) accepted\n", pvt->id);
-			pvt->sms_mode = SMS_MODE_PDU;
+			pvt->sms.mode = SMS_MODE_PDU;
 			/* turn on SMS new message indication */
 			ast_debug(1, "[%s] SMS: enabling new message notifications (AT+CNMI)\n", pvt->id);
 			if (hfp_send_cnmi(pvt->hfp, 0) || msg_queue_push(pvt, AT_OK, AT_CNMI)) {
@@ -5176,7 +5245,7 @@ static int handle_response_ok(struct mbl_pvt *pvt, char *buf)
 		case AT_CNMI_FALLBACK3:
 			ast_debug(1, "[%s] SMS: new message notifications enabled\n", pvt->id);
 			ast_verb(3, "[%s] SMS: %s mode enabled, charset=%s\n",
-				pvt->id, sms_mode_to_str(pvt->sms_mode),
+				pvt->id, sms_mode_to_str(pvt->sms.mode),
 				pvt->cscs_active[0] ? pvt->cscs_active : "default");
 			/* Continue to device status queries */
 			if (!pvt->hfp->no_cops) {
@@ -5188,14 +5257,14 @@ static int handle_response_ok(struct mbl_pvt *pvt, char *buf)
 			break;
 		case AT_CNMI_TEST:
 			/* CNMI test query OK - now send the auto-selected values if valid */
-			if (pvt->cnmi_test_done && pvt->cnmi_selected[0] > 0 && pvt->cnmi_selected[1] > 0) {
+			if (pvt->sms.cnmi.test_done && pvt->sms.cnmi.selected[0] > 0 && pvt->sms.cnmi.selected[1] > 0) {
 				ast_verb(3, "[%s] SMS: Sending auto-selected AT+CNMI=%d,%d,%d,%d,%d\n",
-					pvt->id, pvt->cnmi_selected[0], pvt->cnmi_selected[1],
-					pvt->cnmi_selected[2], pvt->cnmi_selected[3], pvt->cnmi_selected[4]);
+					pvt->id, pvt->sms.cnmi.selected[0], pvt->sms.cnmi.selected[1],
+					pvt->sms.cnmi.selected[2], pvt->sms.cnmi.selected[3], pvt->sms.cnmi.selected[4]);
 				if (hfp_send_cnmi_custom(pvt->hfp,
-				    pvt->cnmi_selected[0], pvt->cnmi_selected[1],
-				    pvt->cnmi_selected[2], pvt->cnmi_selected[3],
-				    pvt->cnmi_selected[4]) || msg_queue_push(pvt, AT_OK, AT_CNMI_QUERY)) {
+				    pvt->sms.cnmi.selected[0], pvt->sms.cnmi.selected[1],
+				    pvt->sms.cnmi.selected[2], pvt->sms.cnmi.selected[3],
+				    pvt->sms.cnmi.selected[4]) || msg_queue_push(pvt, AT_OK, AT_CNMI_QUERY)) {
 					ast_debug(1, "[%s] error sending custom CNMI\n", pvt->id);
 					/* Continue anyway, sending still works */
 				} else {
@@ -5203,7 +5272,7 @@ static int handle_response_ok(struct mbl_pvt *pvt, char *buf)
 				}
 			} else {
 				ast_verb(3, "[%s] SMS: CNMI test completed - no valid mode/mt, receiving disabled, sending enabled (%s mode)\n",
-					pvt->id, sms_mode_to_str(pvt->sms_mode));
+					pvt->id, sms_mode_to_str(pvt->sms.mode));
 			}
 			/* Fall through to continue initialization if no valid CNMI values */
 			if (!pvt->hfp->no_cops) {
@@ -5218,7 +5287,7 @@ static int handle_response_ok(struct mbl_pvt *pvt, char *buf)
 			/* Custom CNMI values accepted! */
 			ast_debug(1, "[%s] SMS: Custom CNMI accepted - notifications enabled\n", pvt->id);
 			ast_verb(3, "[%s] SMS: %s mode enabled (auto-configured CNMI), charset=%s\n",
-				pvt->id, sms_mode_to_str(pvt->sms_mode),
+				pvt->id, sms_mode_to_str(pvt->sms.mode),
 				pvt->cscs_active[0] ? pvt->cscs_active : "default");
 			/* Continue to device status queries */
 			if (!pvt->hfp->no_cops) {
@@ -5295,7 +5364,7 @@ static int handle_response_ok(struct mbl_pvt *pvt, char *buf)
 
 		case AT_A:
 			ast_debug(1, "[%s] answer sent successfully\n", pvt->id);
-			pvt->needchup = true;
+			pvt->call.needchup = true;
 
 			/*
 			 * SCO connection decision based on HFP version:
@@ -5304,7 +5373,7 @@ static int handle_response_ok(struct mbl_pvt *pvt, char *buf)
 			 *
 			 * Only attempt host-initiated SCO for older phones.
 			 */
-			if (pvt->incoming && pvt->sco_socket == -1) {
+			if (pvt->call.incoming && pvt->sco_socket == -1) {
 				if (pvt->hfp->hfp_version >= 16) {
 					ast_debug(1, "[%s] HFP %d.%d - waiting for phone to initiate SCO (per spec)\n",
 						pvt->id, pvt->hfp->hfp_version / 10, pvt->hfp->hfp_version % 10);
@@ -5326,8 +5395,8 @@ static int handle_response_ok(struct mbl_pvt *pvt, char *buf)
 			break;
 		case AT_D:
 			ast_debug(1, "[%s] dial sent successfully\n", pvt->id);
-			pvt->needchup = true;
-			pvt->outgoing = true;
+			pvt->call.needchup = true;
+			pvt->call.outgoing = true;
 			mbl_queue_control(pvt, AST_CONTROL_PROGRESS);
 			break;
 		case AT_CHUP:
@@ -5335,8 +5404,8 @@ static int handle_response_ok(struct mbl_pvt *pvt, char *buf)
 			break;
 		case AT_CMGS:
 			ast_verb(3, "[%s] SMS: sent successfully\n", pvt->id);
-			pvt->outgoing_sms = false;
-			pvt->sms_send_in_progress = false;
+			pvt->sms.outgoing = false;
+			pvt->sms.send_in_progress = false;
 			break;
 		case AT_VTS:
 			ast_debug(1, "[%s] digit sent successfully\n", pvt->id);
@@ -5347,16 +5416,16 @@ static int handle_response_ok(struct mbl_pvt *pvt, char *buf)
 		case AT_CPMS:
 			/* CPMS OK received - +CPMS: response was already parsed by handle_response_cpms */
 			/* Check if we're reading a specific message (from CMTI notification) */
-			if (pvt->sms_index_to_read > 0) {
+			if (pvt->sms.index_to_read > 0) {
 				/* Targeted read: read the specific index from CMTI notification */
 				ast_verb(3, "[%s] Storage '%s' selected, now reading SMS at index %d\n",
-					pvt->id, pvt->sms_storage_pending, pvt->sms_index_to_read);
-				if (hfp_send_cmgr(pvt->hfp, pvt->sms_index_to_read) || msg_queue_push(pvt, AT_CMGR, AT_CMGR)) {
+					pvt->id, pvt->sms.storage_pending, pvt->sms.index_to_read);
+				if (hfp_send_cmgr(pvt->hfp, pvt->sms.index_to_read) || msg_queue_push(pvt, AT_CMGR, AT_CMGR)) {
 					ast_debug(1, "[%s] error sending CMGR to retrieve SMS message\n", pvt->id);
 				}
 			} else {
 				/* Full scan: scan for unread messages */
-				ast_debug(1, "[%s] Scanning \"%s\" for unread messages...\n", pvt->id, pvt->sms_storage_pending);
+				ast_debug(1, "[%s] Scanning \"%s\" for unread messages...\n", pvt->id, pvt->sms.storage_pending);
 				if (hfp_send_cmgl(pvt->hfp, "REC UNREAD") || msg_queue_push(pvt, AT_OK, AT_CMGL)) {
 					ast_debug(1, "[%s] error sending CMGL\n", pvt->id);
 				}
@@ -5366,32 +5435,32 @@ static int handle_response_ok(struct mbl_pvt *pvt, char *buf)
 		case AT_CMGL:
 			/* CMGL list complete - now process collected indices */
 			ast_debug(1, "[%s] CMGL scan complete on storage \"%s\", found %d messages\n",
-				pvt->id, pvt->sms_storage_pending, pvt->sms_pending_count);
+				pvt->id, pvt->sms.storage_pending, pvt->sms.pending_count);
 
 			/* Start reading the first pending message */
-			if (pvt->sms_pending_count > 0) {
-				int idx = pvt->sms_pending_indices[0];
+			if (pvt->sms.pending_count > 0) {
+				int idx = pvt->sms.pending_indices[0];
 				/* Shift the queue */
-				memmove(pvt->sms_pending_indices, pvt->sms_pending_indices + 1,
-					(pvt->sms_pending_count - 1) * sizeof(int));
-				pvt->sms_pending_count--;
+				memmove(pvt->sms.pending_indices, pvt->sms.pending_indices + 1,
+					(pvt->sms.pending_count - 1) * sizeof(int));
+				pvt->sms.pending_count--;
 
-				pvt->sms_index_to_read = idx;
-				ast_verb(3, "[%s] Reading SMS at index %d (%d remaining)\n", pvt->id, idx, pvt->sms_pending_count);
+				pvt->sms.index_to_read = idx;
+				ast_verb(3, "[%s] Reading SMS at index %d (%d remaining)\n", pvt->id, idx, pvt->sms.pending_count);
 				if (hfp_send_cmgr(pvt->hfp, idx) || msg_queue_push(pvt, AT_CMGR, AT_CMGR)) {
 					ast_debug(1, "[%s] error sending CMGR for index %d\n", pvt->id, idx);
 				}
-			} else if (!strcmp(pvt->sms_storage_pending, "ME")) {
+			} else if (!strcmp(pvt->sms.storage_pending, "ME")) {
 				/* No messages in ME, try SM next */
 				ast_verb(3, "[%s] Finished scanning ME, now scanning SM\n", pvt->id);
-				ast_copy_string(pvt->sms_storage_pending, "SM", sizeof(pvt->sms_storage_pending));
+				ast_copy_string(pvt->sms.storage_pending, "SM", sizeof(pvt->sms.storage_pending));
 				if (hfp_send_cpms(pvt->hfp, "SM") || msg_queue_push(pvt, AT_OK, AT_CPMS)) {
 					ast_debug(1, "[%s] error sending CPMS fallback to SM\n", pvt->id);
-					pvt->sms_storage_pending[0] = '\0';
+					pvt->sms.storage_pending[0] = '\0';
 				}
 			} else {
 				/* Scan complete */
-				pvt->sms_storage_pending[0] = '\0';
+				pvt->sms.storage_pending[0] = '\0';
 			}
 			break;
 		case AT_CMGD:
@@ -5401,38 +5470,38 @@ static int handle_response_ok(struct mbl_pvt *pvt, char *buf)
 		case AT_CMGR:
 			/* CMGR response handled */
 			/* Check if we need to delete the message */
-			if (pvt->sms_delete_after_read && pvt->sms_index_to_read > 0) {
-				ast_verb(3, "[%s] Deleting read SMS at index %d\n", pvt->id, pvt->sms_index_to_read);
-				if (hfp_send_cmgd(pvt->hfp, pvt->sms_index_to_read) || msg_queue_push(pvt, AT_OK, AT_CMGD)) {
+			if (pvt->sms.delete_after_read && pvt->sms.index_to_read > 0) {
+				ast_verb(3, "[%s] Deleting read SMS at index %d\n", pvt->id, pvt->sms.index_to_read);
+				if (hfp_send_cmgd(pvt->hfp, pvt->sms.index_to_read) || msg_queue_push(pvt, AT_OK, AT_CMGD)) {
 					ast_debug(1, "[%s] error sending CMGD to delete SMS\n", pvt->id);
 				}
 			}
-			pvt->sms_index_to_read = 0;
+			pvt->sms.index_to_read = 0;
 
 			/* Continue reading remaining pending messages */
-			if (pvt->sms_pending_count > 0) {
-				int idx = pvt->sms_pending_indices[0];
-				memmove(pvt->sms_pending_indices, pvt->sms_pending_indices + 1,
-					(pvt->sms_pending_count - 1) * sizeof(int));
-				pvt->sms_pending_count--;
+			if (pvt->sms.pending_count > 0) {
+				int idx = pvt->sms.pending_indices[0];
+				memmove(pvt->sms.pending_indices, pvt->sms.pending_indices + 1,
+					(pvt->sms.pending_count - 1) * sizeof(int));
+				pvt->sms.pending_count--;
 
-				pvt->sms_index_to_read = idx;
-				ast_verb(3, "[%s] Reading next SMS at index %d (%d remaining)\n", pvt->id, idx, pvt->sms_pending_count);
+				pvt->sms.index_to_read = idx;
+				ast_verb(3, "[%s] Reading next SMS at index %d (%d remaining)\n", pvt->id, idx, pvt->sms.pending_count);
 				if (hfp_send_cmgr(pvt->hfp, idx) || msg_queue_push(pvt, AT_CMGR, AT_CMGR)) {
 					ast_debug(1, "[%s] error sending CMGR for index %d\n", pvt->id, idx);
 				}
-			} else if (!ast_strlen_zero(pvt->sms_storage_pending)) {
+			} else if (!ast_strlen_zero(pvt->sms.storage_pending)) {
 				/* All messages from current storage read, try next storage */
-				if (!strcmp(pvt->sms_storage_pending, "ME")) {
+				if (!strcmp(pvt->sms.storage_pending, "ME")) {
 					ast_verb(3, "[%s] Finished reading from ME, now scanning SM\n", pvt->id);
-					ast_copy_string(pvt->sms_storage_pending, "SM", sizeof(pvt->sms_storage_pending));
+					ast_copy_string(pvt->sms.storage_pending, "SM", sizeof(pvt->sms.storage_pending));
 					if (hfp_send_cpms(pvt->hfp, "SM") || msg_queue_push(pvt, AT_OK, AT_CPMS)) {
 						ast_debug(1, "[%s] error sending CPMS for SM\n", pvt->id);
-						pvt->sms_storage_pending[0] = '\0';
+						pvt->sms.storage_pending[0] = '\0';
 					}
 				} else {
 					/* All done */
-					pvt->sms_storage_pending[0] = '\0';
+					pvt->sms.storage_pending[0] = '\0';
 				}
 			}
 			break;
@@ -5535,11 +5604,11 @@ static int handle_response_error(struct mbl_pvt *pvt, char *buf)
 
 		case AT_CPMS:
 			/* If CPMS set failed, try fallback */
-			ast_debug(1, "[%s] AT+CPMS=\"%s\" failed\n", pvt->id, pvt->sms_storage_pending);
+			ast_debug(1, "[%s] AT+CPMS=\"%s\" failed\n", pvt->id, pvt->sms.storage_pending);
 
-			if (!strcmp(pvt->sms_storage_pending, "MT")) {
+			if (!strcmp(pvt->sms.storage_pending, "MT")) {
 				ast_verb(3, "[%s] AT+CPMS=\"MT\" failed, trying fallback to \"ME\"\n", pvt->id);
-				ast_copy_string(pvt->sms_storage_pending, "ME", sizeof(pvt->sms_storage_pending));
+				ast_copy_string(pvt->sms.storage_pending, "ME", sizeof(pvt->sms.storage_pending));
 				if (hfp_send_cpms(pvt->hfp, "ME") || msg_queue_push(pvt, AT_OK, AT_CPMS)) {
 					/* If send fails, trigger next fallback immediately */
 					goto cpms_fallback_me_failed;
@@ -5549,9 +5618,9 @@ static int handle_response_error(struct mbl_pvt *pvt, char *buf)
 			}
 
 cpms_fallback_me_failed:
-			if (!strcmp(pvt->sms_storage_pending, "ME")) {
+			if (!strcmp(pvt->sms.storage_pending, "ME")) {
 				ast_verb(3, "[%s] AT+CPMS=\"ME\" failed, trying fallback to \"SM\"\n", pvt->id);
-				ast_copy_string(pvt->sms_storage_pending, "SM", sizeof(pvt->sms_storage_pending));
+				ast_copy_string(pvt->sms.storage_pending, "SM", sizeof(pvt->sms.storage_pending));
 				if (hfp_send_cpms(pvt->hfp, "SM") || msg_queue_push(pvt, AT_OK, AT_CPMS)) {
 					goto cpms_fallback_final;
 				}
@@ -5562,16 +5631,16 @@ cpms_fallback_me_failed:
 cpms_fallback_final:
 			/* All CPMS attempts failed, try to read the message anyway */
 			ast_debug(1, "[%s] All AT+CPMS attempts failed, trying to read SMS anyway\n", pvt->id);
-			if (pvt->sms_index_to_read > 0) {
-				if (hfp_send_cmgr(pvt->hfp, pvt->sms_index_to_read)
+			if (pvt->sms.index_to_read > 0) {
+				if (hfp_send_cmgr(pvt->hfp, pvt->sms.index_to_read)
 						|| msg_queue_push(pvt, AT_CMGR, AT_CMGR)) {
 					ast_debug(1, "[%s] error sending CMGR to retrieve SMS message\n", pvt->id);
-					pvt->sms_index_to_read = 0;
+					pvt->sms.index_to_read = 0;
 				} else {
-					pvt->incoming_sms = true; /* Mark as incoming SMS operation */
+					pvt->sms.incoming = true; /* Mark as incoming SMS operation */
 				}
 			}
-			pvt->sms_storage_pending[0] = '\0';
+			pvt->sms.storage_pending[0] = '\0';
 			msg_queue_free_and_pop(pvt);
 			return 0;
 
@@ -5633,7 +5702,7 @@ cpms_fallback_final:
 			/* this is not a fatal error, let's continue with initialization */
 
 			/* Try to set SMS operating mode - text mode first */
-			if (pvt->sms_mode != SMS_MODE_OFF) {
+			if (pvt->sms.mode != SMS_MODE_OFF) {
 				if (hfp_send_cmgf(pvt->hfp, 1) || msg_queue_push(pvt, AT_OK, AT_CMGF)) {
 					ast_debug(1, "[%s] error setting CMGF\n", pvt->id);
 					goto e_return;
@@ -5645,13 +5714,13 @@ cpms_fallback_final:
 			ast_verb(3, "[%s] SMS: text mode failed, trying PDU mode (AT+CMGF=0)\n", pvt->id);
 			if (hfp_send_cmgf(pvt->hfp, 0) || msg_queue_push(pvt, AT_OK, AT_CMGF_PDU)) {
 				ast_debug(1, "[%s] error setting CMGF for PDU mode\n", pvt->id);
-				pvt->sms_mode = SMS_MODE_NO;
+				pvt->sms.mode = SMS_MODE_NO;
 				goto err_chain_creg;
 			}
 			break;
 		case AT_CMGF_PDU:
 			/* PDU mode also failed - SMS not supported */
-			pvt->sms_mode = SMS_MODE_NO;
+			pvt->sms.mode = SMS_MODE_NO;
 			ast_verb(3, "[%s] SMS: PDU mode also failed - SMS disabled\n", pvt->id);
 			/* Continue with device status chain */
 			if (!pvt->hfp->no_cops) {
@@ -5689,7 +5758,7 @@ cpms_fallback_final:
 			ast_verb(3, "[%s] SMS: CNMI mode 2,1 failed, trying 1,1\n", pvt->id);
 			if (hfp_send_cnmi(pvt->hfp, 1) || msg_queue_push(pvt, AT_OK, AT_CNMI_FALLBACK1)) {
 				ast_debug(1, "[%s] error setting CNMI fallback1\n", pvt->id);
-				pvt->sms_mode = SMS_MODE_NO;
+				pvt->sms.mode = SMS_MODE_NO;
 				goto err_chain_creg;
 			}
 			break;
@@ -5698,7 +5767,7 @@ cpms_fallback_final:
 			ast_verb(3, "[%s] SMS: CNMI mode 1,1 failed, trying 1,2\n", pvt->id);
 			if (hfp_send_cnmi(pvt->hfp, 2) || msg_queue_push(pvt, AT_OK, AT_CNMI_FALLBACK2)) {
 				ast_debug(1, "[%s] error setting CNMI fallback2\n", pvt->id);
-				pvt->sms_mode = SMS_MODE_NO;
+				pvt->sms.mode = SMS_MODE_NO;
 				goto err_chain_creg;
 			}
 			break;
@@ -5707,7 +5776,7 @@ cpms_fallback_final:
 			ast_verb(3, "[%s] SMS: CNMI mode 1,2 failed, trying 3,1 (link-active mode)\n", pvt->id);
 			if (hfp_send_cnmi(pvt->hfp, 3) || msg_queue_push(pvt, AT_OK, AT_CNMI_FALLBACK3)) {
 				ast_debug(1, "[%s] error setting CNMI fallback3\n", pvt->id);
-				pvt->sms_mode = SMS_MODE_NO;
+				pvt->sms.mode = SMS_MODE_NO;
 				goto err_chain_creg;
 			}
 			break;
@@ -5717,14 +5786,14 @@ cpms_fallback_final:
 			if (hfp_send_cnmi_test(pvt->hfp) || msg_queue_push(pvt, AT_OK, AT_CNMI_TEST)) {
 				/* Query failed, continue without it */
 				ast_verb(3, "[%s] SMS: CNMI test query failed - receiving disabled, sending enabled (%s mode)\n",
-					pvt->id, sms_mode_to_str(pvt->sms_mode));
+					pvt->id, sms_mode_to_str(pvt->sms.mode));
 				goto cnmi_done;
 			}
 			break;
 		case AT_CNMI_TEST:
 			/* CNMI test query failed - this is fine, we tried */
 			ast_verb(3, "[%s] SMS: CNMI=? not supported - receiving disabled, sending enabled (%s mode)\n",
-				pvt->id, sms_mode_to_str(pvt->sms_mode));
+				pvt->id, sms_mode_to_str(pvt->sms.mode));
 			/* Fall through */
 cnmi_done:
 			/* Continue with device status chain */
@@ -5816,50 +5885,50 @@ cnmi_done:
 			break;
 		case AT_D:
 			ast_debug(1, "[%s] dial failed\n", pvt->id);
-			pvt->needchup = false;
+			pvt->call.needchup = false;
 			mbl_queue_control(pvt, AST_CONTROL_CONGESTION);
 			break;
 		case AT_CHUP:
 			ast_debug(1, "[%s] error sending hangup, disconnecting\n", pvt->id);
 			goto e_return;
 		case AT_CMGR:
-			ast_debug(1, "[%s] error reading sms message (index %d, mem %s)\n", pvt->id, pvt->sms_index_to_read, pvt->sms_storage_pending);
+			ast_debug(1, "[%s] error reading sms message (index %d, mem %s)\n", pvt->id, pvt->sms.index_to_read, pvt->sms.storage_pending);
 
 			/* Read-First Strategy Failed:
 			 * If sms_storage_pending is empty, it means we tried to read directly from notification index and it failed.
 			 * In this case, start the Full Storage Scan on "ME" then "SM".
 			 * (We skip "MT" for scan because it's usually a combination/alias and CMGL might duplicate or behave oddly)
 			 */
-			if (ast_strlen_zero(pvt->sms_storage_pending)) {
-				ast_verb(3, "[%s] Direct SMS read failed (index %d), starting Full Storage Scan on \"ME\"\n", pvt->id, pvt->sms_index_to_read);
-				ast_copy_string(pvt->sms_storage_pending, "ME", sizeof(pvt->sms_storage_pending));
+			if (ast_strlen_zero(pvt->sms.storage_pending)) {
+				ast_verb(3, "[%s] Direct SMS read failed (index %d), starting Full Storage Scan on \"ME\"\n", pvt->id, pvt->sms.index_to_read);
+				ast_copy_string(pvt->sms.storage_pending, "ME", sizeof(pvt->sms.storage_pending));
 				if (hfp_send_cpms(pvt->hfp, "ME") || msg_queue_push(pvt, AT_OK, AT_CPMS)) {
 					/* If ME fails, try SM immediately */
 					goto scan_fallback_sm;
 				}
 			}
 			/* If we were scanning ME and CPMS failed (unlikely here, handled in CPMS error usually, but safety check) */
-			else if (!strcmp(pvt->sms_storage_pending, "ME")) {
+			else if (!strcmp(pvt->sms.storage_pending, "ME")) {
 scan_fallback_sm:
 				ast_verb(3, "[%s] Storage scan on ME failed, trying SM\n", pvt->id);
-				ast_copy_string(pvt->sms_storage_pending, "SM", sizeof(pvt->sms_storage_pending));
+				ast_copy_string(pvt->sms.storage_pending, "SM", sizeof(pvt->sms.storage_pending));
 				if (hfp_send_cpms(pvt->hfp, "SM") || msg_queue_push(pvt, AT_OK, AT_CPMS)) {
 					ast_debug(1, "[%s] error sending CPMS fallback to SM\n", pvt->id);
-					pvt->sms_storage_pending[0] = '\0';
+					pvt->sms.storage_pending[0] = '\0';
 				}
 			}
 
-			pvt->incoming_sms = false;
-			pvt->sms_index_to_read = 0;
+			pvt->sms.incoming = false;
+			pvt->sms.index_to_read = 0;
 			/* Don't clear sms_storage_pending if we just set it! Only if we are done. */
-			if (ast_strlen_zero(pvt->sms_storage_pending)) {
+			if (ast_strlen_zero(pvt->sms.storage_pending)) {
 				/* All done or failed */
 			}
 			break;
 		case AT_CMGS:
 			ast_debug(1, "[%s] error sending sms message\n", pvt->id);
-			pvt->outgoing_sms = false;
-			pvt->sms_send_in_progress = false;
+			pvt->sms.outgoing = false;
+			pvt->sms.send_in_progress = false;
 			break;
 		case AT_VTS:
 			ast_debug(1, "[%s] error sending digit\n", pvt->id);
@@ -5934,13 +6003,13 @@ static int handle_response_ciev(struct mbl_pvt *pvt, char *buf)
 					return -1;
 				}
 			}
-			pvt->needchup = false;
-			pvt->needcallerid = false;
-			pvt->incoming = false;
-			pvt->outgoing = false;
+			pvt->call.needchup = false;
+			pvt->call.needcallerid = false;
+			pvt->call.incoming = false;
+			pvt->call.outgoing = false;
 			break;
 		case HFP_CIND_CALL_ACTIVE:
-			if (pvt->outgoing) {
+			if (pvt->call.outgoing) {
 				ast_debug(1, "[%s] remote end answered\n", pvt->id);
 
 				if (pvt->sco_socket == -1) {
@@ -5958,9 +6027,9 @@ static int handle_response_ciev(struct mbl_pvt *pvt, char *buf)
 				hfp_send_vgm(pvt->hfp, 13);
 
 				mbl_queue_control(pvt, AST_CONTROL_ANSWER);
-			} else if (pvt->incoming && pvt->answered) {
+			} else if (pvt->call.incoming && pvt->call.answered) {
 				ast_setstate(pvt->owner, AST_STATE_UP);
-			} else if (pvt->incoming) {
+			} else if (pvt->call.incoming) {
 				/* user answered from handset, disconnecting */
 				ast_verb(3, "[%s] user answered bluetooth device from handset, disconnecting\n", pvt->id);
 				mbl_queue_hangup(pvt);
@@ -5983,19 +6052,19 @@ static int handle_response_ciev(struct mbl_pvt *pvt, char *buf)
 						return -1;
 					}
 				}
-				pvt->needchup = false;
-				pvt->needcallerid = false;
-				pvt->incoming = false;
-				pvt->outgoing = false;
+				pvt->call.needchup = false;
+				pvt->call.needcallerid = false;
+				pvt->call.incoming = false;
+				pvt->call.outgoing = false;
 			}
 			break;
 		case HFP_CIND_CALLSETUP_INCOMING:
 			ast_debug(1, "[%s] incoming call, waiting for caller id\n", pvt->id);
-			pvt->needcallerid = true;
-			pvt->incoming = true;
+			pvt->call.needcallerid = true;
+			pvt->call.incoming = true;
 			break;
 		case HFP_CIND_CALLSETUP_OUTGOING:
-			if (pvt->outgoing) {
+			if (pvt->call.outgoing) {
 				pvt->hfp->sent_alerting = false;
 				ast_debug(1, "[%s] outgoing call\n", pvt->id);
 			} else {
@@ -6004,7 +6073,7 @@ static int handle_response_ciev(struct mbl_pvt *pvt, char *buf)
 			}
 			break;
 		case HFP_CIND_CALLSETUP_ALERTING:
-			if (pvt->outgoing) {
+			if (pvt->call.outgoing) {
 				ast_debug(1, "[%s] remote alerting\n", pvt->id);
 				mbl_queue_control(pvt, AST_CONTROL_RINGING);
 				pvt->hfp->sent_alerting = true;
@@ -6036,7 +6105,7 @@ static int handle_response_clip(struct mbl_pvt *pvt, char *buf)
 	if ((msg = msg_queue_head(pvt)) && msg->expected == AT_CLIP) {
 		msg_queue_free_and_pop(pvt);
 
-		pvt->needcallerid = false;
+		pvt->call.needcallerid = false;
 		cidinfo = hfp_parse_clip(pvt->hfp, buf);
 
 		/* Decode caller name if in UCS2 mode */
@@ -6055,7 +6124,7 @@ static int handle_response_clip(struct mbl_pvt *pvt, char *buf)
 
 		/* from this point on, we need to send a chup in the event of a
 		 * hangup */
-		pvt->needchup = true;
+		pvt->call.needchup = true;
 
 		if (ast_pbx_start(chan)) {
 			ast_log(LOG_ERROR, "[%s] unable to start pbx on incoming call\n", pvt->id);
@@ -6076,7 +6145,7 @@ static int handle_response_clip(struct mbl_pvt *pvt, char *buf)
  */
 static int handle_response_ring(struct mbl_pvt *pvt, char *buf)
 {
-	if (pvt->needcallerid) {
+	if (pvt->call.needcallerid) {
 		ast_debug(1, "[%s] got ring while waiting for caller id\n", pvt->id);
 		return msg_queue_push(pvt, AT_CLIP, AT_UNKNOWN);
 	} else {
@@ -6101,7 +6170,7 @@ static int mbl_sms_delayed_read(const void *data)
 	ast_mutex_lock(&pvt->lock);
 
 	/* Clear scheduler ID since we're running now */
-	pvt->sms_cmti_sched_id = -1;
+	pvt->sms.cmti_sched_id = -1;
 
 	if (!pvt->connected || !pvt->hfp || !pvt->hfp->initialized) {
 		ast_debug(1, "[%s] SMS: delayed read cancelled - device not ready\n", pvt->id);
@@ -6109,24 +6178,24 @@ static int mbl_sms_delayed_read(const void *data)
 		return 0;
 	}
 
-	if (pvt->sms_pending_count <= 0) {
+	if (pvt->sms.pending_count <= 0) {
 		ast_debug(1, "[%s] SMS: delayed read - no pending messages\n", pvt->id);
 		ast_mutex_unlock(&pvt->lock);
 		return 0;
 	}
 
 	ast_verb(3, "[%s] SMS: delayed read triggered - processing %d queued notifications\n",
-		pvt->id, pvt->sms_pending_count);
+		pvt->id, pvt->sms.pending_count);
 
 	/* Start reading the first pending message */
-	int idx = pvt->sms_pending_indices[0];
-	pvt->sms_index_to_read = idx;
+	int idx = pvt->sms.pending_indices[0];
+	pvt->sms.index_to_read = idx;
 
 	/* Select storage if we have one stored, otherwise read directly */
-	if (!ast_strlen_zero(pvt->sms_storage_pending)) {
+	if (!ast_strlen_zero(pvt->sms.storage_pending)) {
 		ast_verb(3, "[%s] SMS: selecting storage '%s' for delayed read of index %d\n",
-			pvt->id, pvt->sms_storage_pending, idx);
-		if (hfp_send_cpms(pvt->hfp, pvt->sms_storage_pending) ||
+			pvt->id, pvt->sms.storage_pending, idx);
+		if (hfp_send_cpms(pvt->hfp, pvt->sms.storage_pending) ||
 			msg_queue_push(pvt, AT_OK, AT_CPMS)) {
 			ast_debug(1, "[%s] error sending CPMS for delayed SMS read\n", pvt->id);
 		}
@@ -6138,11 +6207,11 @@ static int mbl_sms_delayed_read(const void *data)
 	}
 
 	/* Remove the first index from queue */
-	memmove(pvt->sms_pending_indices, pvt->sms_pending_indices + 1,
-		(pvt->sms_pending_count - 1) * sizeof(int));
-	pvt->sms_pending_count--;
+	memmove(pvt->sms.pending_indices, pvt->sms.pending_indices + 1,
+		(pvt->sms.pending_count - 1) * sizeof(int));
+	pvt->sms.pending_count--;
 
-	pvt->incoming_sms = true;
+	pvt->sms.incoming = true;
 
 	ast_mutex_unlock(&pvt->lock);
 	return 0;  /* Don't reschedule */
@@ -6157,28 +6226,28 @@ static int mbl_sms_delayed_read(const void *data)
  */
 static void process_pending_sms(struct mbl_pvt *pvt)
 {
-	if (pvt->sms_pending_count > 0) {
+	if (pvt->sms.pending_count > 0) {
 		ast_verb(3, "[%s] SMS: processing %d pending notifications from init\n",
-			pvt->id, pvt->sms_pending_count);
+			pvt->id, pvt->sms.pending_count);
 
 		/* Start reading the first pending message */
-		int idx = pvt->sms_pending_indices[0];
+		int idx = pvt->sms.pending_indices[0];
 
 		/* Shift the queue */
-		memmove(pvt->sms_pending_indices, pvt->sms_pending_indices + 1,
-			(pvt->sms_pending_count - 1) * sizeof(int));
-		pvt->sms_pending_count--;
+		memmove(pvt->sms.pending_indices, pvt->sms.pending_indices + 1,
+			(pvt->sms.pending_count - 1) * sizeof(int));
+		pvt->sms.pending_count--;
 
-		pvt->sms_index_to_read = idx;
+		pvt->sms.index_to_read = idx;
 
 		/* Select storage if we have one stored */
-		if (!ast_strlen_zero(pvt->sms_storage_pending)) {
+		if (!ast_strlen_zero(pvt->sms.storage_pending)) {
 			ast_verb(3, "[%s] SMS: selecting storage '%s' for deferred index %d\n",
-				pvt->id, pvt->sms_storage_pending, idx);
-			if (hfp_send_cpms(pvt->hfp, pvt->sms_storage_pending) ||
+				pvt->id, pvt->sms.storage_pending, idx);
+			if (hfp_send_cpms(pvt->hfp, pvt->sms.storage_pending) ||
 				msg_queue_push(pvt, AT_OK, AT_CPMS)) {
 				ast_debug(1, "[%s] error sending CPMS for deferred SMS\n", pvt->id);
-				pvt->sms_storage_pending[0] = '\0';
+				pvt->sms.storage_pending[0] = '\0';
 			}
 		} else {
 			/* Direct read */
@@ -6208,9 +6277,9 @@ static int handle_response_cmti(struct mbl_pvt *pvt, char *buf)
 		if (!pvt->hfp->initialized) {
 			ast_verb(3, "[%s] SMS: device still initializing, queueing SMS index %d for later\n", pvt->id, index);
 			/* Store in pending queue for processing after init */
-			if (pvt->sms_pending_count < 32) {
-				pvt->sms_pending_indices[pvt->sms_pending_count++] = index;
-				ast_copy_string(pvt->sms_storage_pending, mem, sizeof(pvt->sms_storage_pending));
+			if (pvt->sms.pending_count < 32) {
+				pvt->sms.pending_indices[pvt->sms.pending_count++] = index;
+				ast_copy_string(pvt->sms.storage_pending, mem, sizeof(pvt->sms.storage_pending));
 			} else {
 				ast_log(LOG_WARNING, "[%s] SMS: pending queue full, dropping notification for index %d\n", pvt->id, index);
 			}
@@ -6220,9 +6289,9 @@ static int handle_response_cmti(struct mbl_pvt *pvt, char *buf)
 		/* Queue the notification - don't read immediately.
 		 * This allows multi-part SMS messages to fully arrive before we start reading.
 		 */
-		if (pvt->sms_pending_count < 32) {
-			pvt->sms_pending_indices[pvt->sms_pending_count++] = index;
-			ast_verb(3, "[%s] SMS: queued index %d (%d total pending)\n", pvt->id, index, pvt->sms_pending_count);
+		if (pvt->sms.pending_count < 32) {
+			pvt->sms.pending_indices[pvt->sms.pending_count++] = index;
+			ast_verb(3, "[%s] SMS: queued index %d (%d total pending)\n", pvt->id, index, pvt->sms.pending_count);
 		} else {
 			ast_log(LOG_WARNING, "[%s] SMS: pending queue full, dropping notification for index %d\n", pvt->id, index);
 			return 0;
@@ -6230,26 +6299,26 @@ static int handle_response_cmti(struct mbl_pvt *pvt, char *buf)
 
 		/* Store storage info if provided */
 		if (!ast_strlen_zero(mem)) {
-			ast_copy_string(pvt->sms_storage_pending, mem, sizeof(pvt->sms_storage_pending));
+			ast_copy_string(pvt->sms.storage_pending, mem, sizeof(pvt->sms.storage_pending));
 		}
 
 		/* Cancel existing timer and schedule a new one.
 		 * This resets the delay on each new CMTI so multi-part SMS parts all arrive.
 		 */
-		if (pvt->sms_cmti_sched_id > -1) {
+		if (pvt->sms.cmti_sched_id > -1) {
 			ast_verb(4, "[%s] SMS: resetting read timer (new CMTI arrived)\n", pvt->id);
-			AST_SCHED_DEL(pvt->sched, pvt->sms_cmti_sched_id);
+			AST_SCHED_DEL(pvt->sched, pvt->sms.cmti_sched_id);
 		}
 
-		pvt->sms_cmti_sched_id = ast_sched_add(pvt->sched, SMS_CMTI_DELAY_MS, mbl_sms_delayed_read, pvt);
+		pvt->sms.cmti_sched_id = ast_sched_add(pvt->sched, SMS_CMTI_DELAY_MS, mbl_sms_delayed_read, pvt);
 		ast_debug(1, "[%s] SMS: ast_sched_add returned id=%d (sched=%p)\n",
-			pvt->id, pvt->sms_cmti_sched_id, pvt->sched);
-		if (pvt->sms_cmti_sched_id < 0) {
+			pvt->id, pvt->sms.cmti_sched_id, pvt->sched);
+		if (pvt->sms.cmti_sched_id < 0) {
 			ast_log(LOG_WARNING, "[%s] SMS: failed to schedule delayed read\n", pvt->id);
 			/* Fall back to immediate read */
-			pvt->sms_index_to_read = index;
-			if (!ast_strlen_zero(pvt->sms_storage_pending)) {
-				if (hfp_send_cpms(pvt->hfp, pvt->sms_storage_pending) || msg_queue_push(pvt, AT_OK, AT_CPMS)) {
+			pvt->sms.index_to_read = index;
+			if (!ast_strlen_zero(pvt->sms.storage_pending)) {
+				if (hfp_send_cpms(pvt->hfp, pvt->sms.storage_pending) || msg_queue_push(pvt, AT_OK, AT_CPMS)) {
 					ast_debug(1, "[%s] error sending CPMS\n", pvt->id);
 				}
 			} else {
@@ -6257,7 +6326,7 @@ static int handle_response_cmti(struct mbl_pvt *pvt, char *buf)
 					ast_debug(1, "[%s] error sending CMGR\n", pvt->id);
 				}
 			}
-			pvt->incoming_sms = true;
+			pvt->sms.incoming = true;
 		} else {
 			ast_verb(3, "[%s] SMS: scheduled delayed read in %d ms\n", pvt->id, SMS_CMTI_DELAY_MS);
 		}
@@ -6292,17 +6361,17 @@ static int handle_response_cmgr(struct mbl_pvt *pvt, char *buf)
 	if ((entry = msg_queue_head(pvt)) && entry->expected == AT_CMGR) {
 		msg_queue_free_and_pop(pvt);
 		have_queue_entry = 1;
-	} else if (pvt->sms_pending_count > 0 || pvt->incoming_sms) {
+	} else if (pvt->sms.pending_count > 0 || pvt->sms.incoming) {
 		/* No queue entry but we're expecting SMS - process anyway.
 		 * This handles queue contention between SMS send and receive operations.
 		 */
 		ast_debug(1, "[%s] CMGR: processing without queue entry (pending=%d, incoming=%d)\n",
-			pvt->id, pvt->sms_pending_count, pvt->incoming_sms);
+			pvt->id, pvt->sms.pending_count, pvt->sms.incoming);
 		have_queue_entry = 1;  /* Treat as valid */
 	}
 
 	if (have_queue_entry) {
-		if (pvt->sms_mode == SMS_MODE_PDU) {
+		if (pvt->sms.mode == SMS_MODE_PDU) {
 			/* PDU mode: buf contains hex-encoded PDU after +CMGR: header */
 			/* Format: +CMGR: <stat>,[<alpha>],<length>\r\n<pdu>\r\n */
 			ast_debug(1, "[%s] CMGR PDU mode response: '%s'\n", pvt->id, buf);
@@ -6329,7 +6398,7 @@ static int handle_response_cmgr(struct mbl_pvt *pvt, char *buf)
 				/* Check if PDU data is empty or just "OK" */
 				if (strlen(pdu_start) < 10 || !strncmp(pdu_start, "OK", 2)) {
 					ast_log(LOG_WARNING, "[%s] SMS: empty or invalid PDU data in CMGR response (length insufficient)\n", pvt->id);
-					pvt->incoming_sms = false;
+					pvt->sms.incoming = false;
 					return 0;  /* Non-fatal - message might be deleted or empty */
 				}
 			} else {
@@ -6376,7 +6445,7 @@ static int handle_response_cmgr(struct mbl_pvt *pvt, char *buf)
 
 				if (!pdu_start || strlen(pdu_start) < 10) {
 					ast_debug(1, "[%s] CMGR: failed to get valid PDU body\n", pvt->id);
-					pvt->incoming_sms = false;
+					pvt->sms.incoming = false;
 					return 0;  /* Non-fatal */
 				}
 			}
@@ -6393,7 +6462,7 @@ static int handle_response_cmgr(struct mbl_pvt *pvt, char *buf)
 					pvt->id, from_number, strlen(text));
 			} else {
 				ast_log(LOG_WARNING, "[%s] error decoding PDU SMS, PDU='%s'\n", pvt->id, pdu_start);
-				pvt->incoming_sms = false;
+				pvt->sms.incoming = false;
 				return 0;  /* Non-fatal */
 			}
 		} else {
@@ -6432,7 +6501,7 @@ static int handle_response_cmgr(struct mbl_pvt *pvt, char *buf)
 				}
 			}
 		}
-		pvt->incoming_sms = false;
+		pvt->sms.incoming = false;
 
 		/* Create message using ast_msg API for SIP MESSAGE routing */
 		msg = ast_msg_alloc();
@@ -6475,24 +6544,24 @@ static int handle_response_cmgr(struct mbl_pvt *pvt, char *buf)
 		}
 
 		/* Check if there are more pending SMS messages to read */
-		if (pvt->sms_pending_count > 0) {
+		if (pvt->sms.pending_count > 0) {
 			ast_debug(1, "[%s] SMS: %d more pending, triggering next read\n",
-				pvt->id, pvt->sms_pending_count);
+				pvt->id, pvt->sms.pending_count);
 
 			/* Get next index from queue */
-			int next_idx = pvt->sms_pending_indices[0];
-			pvt->sms_index_to_read = next_idx;
+			int next_idx = pvt->sms.pending_indices[0];
+			pvt->sms.index_to_read = next_idx;
 
 			/* Shift the queue */
-			memmove(pvt->sms_pending_indices, pvt->sms_pending_indices + 1,
-				(pvt->sms_pending_count - 1) * sizeof(int));
-			pvt->sms_pending_count--;
+			memmove(pvt->sms.pending_indices, pvt->sms.pending_indices + 1,
+				(pvt->sms.pending_count - 1) * sizeof(int));
+			pvt->sms.pending_count--;
 
 			/* Read the next message */
-			if (!ast_strlen_zero(pvt->sms_storage_pending)) {
+			if (!ast_strlen_zero(pvt->sms.storage_pending)) {
 				ast_verb(3, "[%s] SMS: reading next pending index %d from storage '%s'\n",
-					pvt->id, next_idx, pvt->sms_storage_pending);
-				if (hfp_send_cpms(pvt->hfp, pvt->sms_storage_pending) ||
+					pvt->id, next_idx, pvt->sms.storage_pending);
+				if (hfp_send_cpms(pvt->hfp, pvt->sms.storage_pending) ||
 					msg_queue_push(pvt, AT_OK, AT_CPMS)) {
 					ast_debug(1, "[%s] error sending CPMS for next SMS\n", pvt->id);
 				}
@@ -6502,7 +6571,7 @@ static int handle_response_cmgr(struct mbl_pvt *pvt, char *buf)
 					ast_debug(1, "[%s] error sending CMGR for next SMS\n", pvt->id);
 				}
 			}
-			pvt->incoming_sms = true;
+			pvt->sms.incoming = true;
 		}
 	} else {
 		ast_debug(1, "[%s] got unexpected +CMGR message, ignoring\n", pvt->id);
@@ -7514,14 +7583,14 @@ static int mobile_msg_send(const struct ast_msg *msg, const char *to, const char
 		return -1;
 	}
 
-	if (pvt->sms_mode < SMS_MODE_TEXT) {
+	if (pvt->sms.mode < SMS_MODE_TEXT) {
 		ast_log(LOG_ERROR, "mobile MESSAGE: device '%s' does not support SMS\n", device_id);
 		ast_mutex_unlock(&pvt->lock);
 		return -1;
 	}
 
 	/* Check if another SMS send is already in progress */
-	if (pvt->sms_send_in_progress) {
+	if (pvt->sms.send_in_progress) {
 		ast_log(LOG_WARNING, "mobile MESSAGE: device '%s' is busy sending another SMS, try again later\n", device_id);
 		ast_mutex_unlock(&pvt->lock);
 		return -1;
@@ -7550,7 +7619,7 @@ static int mobile_msg_send(const struct ast_msg *msg, const char *to, const char
 		/* Will be truncated below */
 	}
 
-	if (pvt->sms_mode == SMS_MODE_PDU) {
+	if (pvt->sms.mode == SMS_MODE_PDU) {
 		/* PDU mode: encode message as PDU */
 		char pdu_hex[520];
 		int pdu_len;
@@ -7622,7 +7691,7 @@ static int mobile_msg_send(const struct ast_msg *msg, const char *to, const char
 			ast_mutex_unlock(&pvt->lock);
 			return -1;
 		}
-		pvt->sms_send_in_progress = true;
+		pvt->sms.send_in_progress = true;
 	} else {
 		/* Text mode: handle encoding based on active charset */
 		if (!strcmp(pvt->cscs_active, "UCS2")) {
@@ -7719,7 +7788,7 @@ static int mobile_msg_send(const struct ast_msg *msg, const char *to, const char
 				ast_debug(1, "[%s] SMS queued: %d parts, expecting AT_SMS_PROMPT for each\n", pvt->id, total_parts);
 			}
 			/* Skip the common message queue code below for UCS2 - already handled above */
-			pvt->sms_send_in_progress = true;
+			pvt->sms.send_in_progress = true;
 			ast_mutex_unlock(&pvt->lock);
 			return 0;
 		} else {
@@ -7746,7 +7815,7 @@ static int mobile_msg_send(const struct ast_msg *msg, const char *to, const char
 				ast_mutex_unlock(&pvt->lock);
 				return -1;
 			}
-			pvt->sms_send_in_progress = true;
+			pvt->sms.send_in_progress = true;
 			ast_debug(1, "[%s] SMS queued: expecting AT_SMS_PROMPT, response_to=AT_CMGS\n", pvt->id);
 		}
 	}
@@ -7783,7 +7852,7 @@ static int handle_sms_prompt(struct mbl_pvt *pvt, char *buf)
 
 	/* Send message data based on SMS mode */
 	int send_result;
-	if (pvt->sms_mode == SMS_MODE_PDU) {
+	if (pvt->sms.mode == SMS_MODE_PDU) {
 		/* PDU mode: data is hex-encoded PDU string */
 		log_pdu_outgoing(pvt->id, msg->data);  /* Log PDU header details */
 		send_result = hfp_send_sms_pdu(pvt->hfp, msg->data);
@@ -7848,19 +7917,19 @@ static int hfp_parse_cscs(char *buf, struct mbl_pvt *pvt)
 
 	/* Parse individual charsets */
 	if (strstr(buf, "\"UTF-8\"") || strstr(buf, "\"UTF8\"")) {
-		pvt->has_utf8 = true;
+		pvt->sms.has_utf8 = true;
 		found = 1;
 	}
 	if (strstr(buf, "\"UCS2\"") || strstr(buf, "\"UCS-2\"")) {
-		pvt->has_ucs2 = true;
+		pvt->sms.has_ucs2 = true;
 		found = 1;
 	}
 	if (strstr(buf, "\"GSM\"")) {
-		pvt->has_gsm = true;
+		pvt->sms.has_gsm = true;
 		found = 1;
 	}
 	if (strstr(buf, "\"IRA\"")) {
-		pvt->has_ira = true;
+		pvt->sms.has_ira = true;
 		found = 1;
 	}
 
@@ -8029,14 +8098,14 @@ static int handle_response_cpms(struct mbl_pvt *pvt, char *buf)
 {
 	int used = 0, total = 0;
 	hfp_parse_cpms_response(pvt->hfp, buf, &used, &total);
-	ast_verb(3, "[%s] Storage \"%s\": Used %d/%d messages\n", pvt->id, pvt->sms_storage_pending, used, total);
+	ast_verb(3, "[%s] Storage \"%s\": Used %d/%d messages\n", pvt->id, pvt->sms.storage_pending, used, total);
 
 	/* If we don't have a specific index to read, use the used count as a hint.
 	 * On Samsung phones and others, the newest message is often stored at index = used count.
 	 * This is a workaround for phones where CMGL doesn't work over Bluetooth.
 	 */
-	if (pvt->sms_index_to_read == 0 && used > 0) {
-		pvt->sms_index_to_read = used;
+	if (pvt->sms.index_to_read == 0 && used > 0) {
+		pvt->sms.index_to_read = used;
 		ast_debug(1, "[%s] SMS: No specific index, will try reading at index %d (from CPMS used count)\n", pvt->id, used);
 	}
 
@@ -8058,8 +8127,8 @@ static int handle_response_cmgl(struct mbl_pvt *pvt, char *buf)
 		ast_verb(3, "[%s] Found unread SMS at index %d\n", pvt->id, index);
 
 		/* Queue the index for later processing (after CMGL OK) */
-		if (pvt->sms_pending_count < 32) {
-			pvt->sms_pending_indices[pvt->sms_pending_count++] = index;
+		if (pvt->sms.pending_count < 32) {
+			pvt->sms.pending_indices[pvt->sms.pending_count++] = index;
 		} else {
 			ast_debug(1, "[%s] Too many pending SMS indices, ignoring index %d\n", pvt->id, index);
 		}
@@ -8077,8 +8146,8 @@ static int handle_response_cmgl(struct mbl_pvt *pvt, char *buf)
  */
 static int handle_response_busy(struct mbl_pvt *pvt)
 {
-	pvt->hangup_cause = AST_CAUSE_USER_BUSY;
-	pvt->needchup = true;
+	pvt->call.hangup_cause = AST_CAUSE_USER_BUSY;
+	pvt->call.needchup = true;
 	mbl_queue_control(pvt, AST_CONTROL_BUSY);
 	return 0;
 }
@@ -8093,7 +8162,7 @@ static int handle_response_busy(struct mbl_pvt *pvt)
 static int handle_response_no_dialtone(struct mbl_pvt *pvt, char *buf)
 {
 	ast_verb(1, "[%s] mobile reports NO DIALTONE\n", pvt->id);
-	pvt->needchup = true;
+	pvt->call.needchup = true;
 	mbl_queue_control(pvt, AST_CONTROL_CONGESTION);
 	return 0;
 }
@@ -8108,7 +8177,7 @@ static int handle_response_no_dialtone(struct mbl_pvt *pvt, char *buf)
 static int handle_response_no_carrier(struct mbl_pvt *pvt, char *buf)
 {
 	ast_verb(1, "[%s] mobile reports NO CARRIER\n", pvt->id);
-	pvt->needchup = true;
+	pvt->call.needchup = true;
 	mbl_queue_control(pvt, AST_CONTROL_CONGESTION);
 	return 0;
 }
@@ -8147,9 +8216,9 @@ static void *do_monitor_phone(void *data)
 
 		/* Check scheduler for pending callbacks (e.g., delayed SMS read) */
 		int sched_wait = ast_sched_wait(pvt->sched);
-		if (pvt->sms_pending_count > 0) {
+		if (pvt->sms.pending_count > 0) {
 			ast_debug(1, "[%s] SMS sched check: timeout=%d, sched_wait=%d, pending=%d, sched_id=%d, sched=%p\n",
-				pvt->id, t, sched_wait, pvt->sms_pending_count, pvt->sms_cmti_sched_id, pvt->sched);
+				pvt->id, t, sched_wait, pvt->sms.pending_count, pvt->sms.cmti_sched_id, pvt->sched);
 		}
 		if (sched_wait >= 0 && (t < 0 || sched_wait < t)) {
 			t = sched_wait;
@@ -8159,7 +8228,7 @@ static void *do_monitor_phone(void *data)
 		}
 
 		/* Debug: Log wait time before rfcomm_wait_readable */
-		if (pvt->sms_pending_count > 0) {
+		if (pvt->sms.pending_count > 0) {
 			ast_debug(1, "[%s] SMS: waiting for data (timeout=%d ms)\n", pvt->id, t);
 		}
 
@@ -8167,7 +8236,7 @@ static void *do_monitor_phone(void *data)
 
 		if (!wait_result) {
 			/* Timeout - run any scheduled tasks that are now due */
-			if (pvt->sms_pending_count > 0) {
+			if (pvt->sms.pending_count > 0) {
 				ast_debug(1, "[%s] SMS: rfcomm_wait_readable timeout, running scheduler\n", pvt->id);
 			}
 			ast_sched_runq(pvt->sched);
@@ -8216,8 +8285,10 @@ static void *do_monitor_phone(void *data)
 		}
 
 		ast_debug(1, "[%s] read %s\n", pvt->id, buf);
-		ast_verb(3, "[%s] AT<- %s [type=%s]\n", pvt->id, buf, at_message_to_str(at_msg));
-
+		ast_verb(3, "[%s] AT<---------------- %s [type=%s]\n", pvt->id, buf, at_message_to_str(at_msg));
+		if ((entry = msg_queue_head(pvt))) {
+			ast_debug(3, "(MSG QUEUE) msg: [%s] expected: [%s]", at_message_to_str(entry->response_to), at_message_to_str(entry->expected));
+		}
 		switch (at_msg) {
 		case AT_BRSF:
 			ast_mutex_lock(&pvt->lock);
@@ -8233,12 +8304,12 @@ static void *do_monitor_phone(void *data)
 				if (entry->response_to == AT_CSCS) {
 					/* Capability Query */
 					if (hfp_parse_cscs(buf, pvt)) {
-						pvt->utf8_candidate = true;
+						pvt->sms.utf8_candidate = true;
 					}
 				} else if (entry->response_to == AT_CSCS_VERIFY) {
 					/* Verify Query */
 					if (hfp_parse_cscs(buf, pvt)) {
-						pvt->has_utf8 = true;
+						pvt->sms.has_utf8 = true;
 					}
 				}
 				msg_queue_push(pvt, AT_OK, entry->response_to);
@@ -8527,28 +8598,28 @@ static void *do_monitor_phone(void *data)
 			ast_mutex_lock(&pvt->lock);
 			{
 				/* Parse and decode the supported CNMI values */
-				if (hfp_parse_cnmi_test(buf, pvt->cnmi_mode_vals, pvt->cnmi_mt_vals,
-				                        pvt->cnmi_bm_vals, pvt->cnmi_ds_vals,
-				                        pvt->cnmi_bfr_vals) == 0) {
+				if (hfp_parse_cnmi_test(buf, pvt->sms.cnmi.mode_vals, pvt->sms.cnmi.mt_vals,
+				                        pvt->sms.cnmi.bm_vals, pvt->sms.cnmi.ds_vals,
+				                        pvt->sms.cnmi.bfr_vals) == 0) {
 					/* Log decoded meanings as NOTICE */
-					cnmi_log_parsed(pvt->id, pvt->cnmi_mode_vals, pvt->cnmi_mt_vals,
-					                pvt->cnmi_bm_vals, pvt->cnmi_ds_vals, pvt->cnmi_bfr_vals);
+					cnmi_log_parsed(pvt->id, pvt->sms.cnmi.mode_vals, pvt->sms.cnmi.mt_vals,
+					                pvt->sms.cnmi.bm_vals, pvt->sms.cnmi.ds_vals, pvt->sms.cnmi.bfr_vals);
 
 					/* Select optimal values */
-					pvt->cnmi_selected[0] = cnmi_select_mode(pvt->cnmi_mode_vals);
-					pvt->cnmi_selected[1] = cnmi_select_mt(pvt->cnmi_mt_vals);
-					pvt->cnmi_selected[2] = cnmi_select_bm(pvt->cnmi_bm_vals);
-					pvt->cnmi_selected[3] = cnmi_select_ds(pvt->cnmi_ds_vals);
-					pvt->cnmi_selected[4] = cnmi_select_bfr(pvt->cnmi_bfr_vals);
+					pvt->sms.cnmi.selected[0] = cnmi_select_mode(pvt->sms.cnmi.mode_vals);
+					pvt->sms.cnmi.selected[1] = cnmi_select_mt(pvt->sms.cnmi.mt_vals);
+					pvt->sms.cnmi.selected[2] = cnmi_select_bm(pvt->sms.cnmi.bm_vals);
+					pvt->sms.cnmi.selected[3] = cnmi_select_ds(pvt->sms.cnmi.ds_vals);
+					pvt->sms.cnmi.selected[4] = cnmi_select_bfr(pvt->sms.cnmi.bfr_vals);
 
 					ast_log(LOG_NOTICE, "[%s] CNMI auto-selected: AT+CNMI=%d,%d,%d,%d,%d\n",
-						pvt->id, pvt->cnmi_selected[0], pvt->cnmi_selected[1],
-						pvt->cnmi_selected[2], pvt->cnmi_selected[3], pvt->cnmi_selected[4]);
+						pvt->id, pvt->sms.cnmi.selected[0], pvt->sms.cnmi.selected[1],
+						pvt->sms.cnmi.selected[2], pvt->sms.cnmi.selected[3], pvt->sms.cnmi.selected[4]);
 
-					pvt->cnmi_test_done = true;
+					pvt->sms.cnmi.test_done = true;
 
 					/* Check if we can receive SMS notifications */
-					if (pvt->cnmi_selected[0] <= 0 || pvt->cnmi_selected[1] <= 0) {
+					if (pvt->sms.cnmi.selected[0] <= 0 || pvt->sms.cnmi.selected[1] <= 0) {
 						ast_log(LOG_WARNING, "[%s] CNMI: No valid mode/mt combination for SMS reception\n", pvt->id);
 					}
 				} else {
@@ -8576,27 +8647,27 @@ e_cleanup:
 	ast_mutex_lock(&pvt->lock);
 
 	if (!hfp->initialized) {
-		pvt->hfp_init_fail_count++;
-		if (pvt->hfp_init_fail_count >= 2) {
+		pvt->health.hfp_init_fail_count++;
+		if (pvt->health.hfp_init_fail_count >= 2) {
 			/* Mark device as incompatible after 2 failures */
 			pvt->profile_incompatible = true;
 			mbl_set_state(pvt, MBL_STATE_ERROR);
 			ast_log(LOG_WARNING, "[%s] HFP initialization failed %d times. "
 				"Device does not support Hands-Free Profile properly, "
 				"or has an incompatible HFP implementation. Will not retry connection.\n",
-				pvt->id, pvt->hfp_init_fail_count);
+				pvt->id, pvt->health.hfp_init_fail_count);
 		} else {
 			ast_verb(3, "[%s] HFP initialization failed (attempt %d/2), will retry...\n",
-				pvt->id, pvt->hfp_init_fail_count);
+				pvt->id, pvt->health.hfp_init_fail_count);
 		}
 	} else {
 		/* Successful init resets counter */
-		pvt->hfp_init_fail_count = 0;
+		pvt->health.hfp_init_fail_count = 0;
 	}
 
 	if (pvt->owner) {
 		ast_debug(1, "[%s] device disconnected, hanging up owner\n", pvt->id);
-		pvt->needchup = false;
+		pvt->call.needchup = false;
 		mbl_queue_hangup(pvt);
 	}
 
@@ -8912,14 +8983,14 @@ static void *do_discovery(void *data)
 
 			/* Check if device address changed (config was modified) - reset failure flags */
 			if (bacmp(&pvt->addr, &pvt->last_checked_addr) != 0) {
-				if (pvt->profile_incompatible || pvt->sdp_fail_count || pvt->hfp_init_fail_count) {
+				if (pvt->profile_incompatible || pvt->health.sdp_fail_count || pvt->health.hfp_init_fail_count) {
 					char addr_str[18];
 					ba2str(&pvt->addr, addr_str);
 					ast_verb(3, "[%s] Device address changed to %s, resetting failure counters\n",
 						pvt->id, addr_str);
 					pvt->profile_incompatible = false;
-					pvt->sdp_fail_count = 0;
-					pvt->hfp_init_fail_count = 0;
+					pvt->health.sdp_fail_count = 0;
+					pvt->health.hfp_init_fail_count = 0;
 					pvt->rfcomm_port = 0;  /* Re-detect port for new device */
 					mbl_set_state(pvt, MBL_STATE_INIT);
 				}
@@ -8946,15 +9017,15 @@ static void *do_discovery(void *data)
 					if (detected_port > 0) {
 						ast_verb(3, "Auto-detected port %d for device %s\n", detected_port, pvt->id);
 						pvt->rfcomm_port = detected_port;
-						pvt->sdp_fail_count = 0;
+						pvt->health.sdp_fail_count = 0;
 						ast_copy_string(pvt->profile_name, "HFP", sizeof(pvt->profile_name));
 					} else if (detected_port == -1) {
 						/* Transient error (device unreachable) - don't count as profile failure */
 						ast_debug(1, "[%s] Device unreachable (transient error), will retry...\n", pvt->id);
 					} else {
 						/* detected_port == 0: SDP connected but profile not found - count as failure */
-						pvt->sdp_fail_count++;
-						if (pvt->sdp_fail_count >= 3) {
+						pvt->health.sdp_fail_count++;
+						if (pvt->health.sdp_fail_count >= 3) {
 							/* Print helpful message and mark as incompatible */
 							pvt->profile_incompatible = true;
 							mbl_set_state(pvt, MBL_STATE_ERROR);
@@ -8962,7 +9033,7 @@ static void *do_discovery(void *data)
 								"A mobile phone must expose the Audio Gateway (AG) role for HFP. "
 								"Will not retry connection.\n", pvt->id);
 						} else {
-							ast_debug(1, "Port detection failed for %s (attempt %d/3)\n", pvt->id, pvt->sdp_fail_count);
+							ast_debug(1, "Port detection failed for %s (attempt %d/3)\n", pvt->id, pvt->health.sdp_fail_count);
 						}
 					}
 				}
@@ -9293,10 +9364,10 @@ static struct mbl_pvt *mbl_load_device(struct ast_config *cfg, const char *cat)
 	pvt->sco_socket = -1;
 	pvt->sco_mtu = DEVICE_FRAME_SIZE_DEFAULT;
 	pvt->monitor_thread = AST_PTHREADT_NULL;
-	pvt->ring_scheduler_id = -1;
+	pvt->call.ring_scheduler_id = -1;
 	pvt->status_scheduler_id = -1;
-	pvt->sms_cmti_sched_id = -1;
-	pvt->sms_mode = SMS_MODE_OFF;  /* Disabled by default, set to YES or AUTO in config to enable */
+	pvt->sms.cmti_sched_id = -1;
+	pvt->sms.mode = SMS_MODE_OFF;  /* Disabled by default, set to YES or AUTO in config to enable */
 
 	/* setup the sco_output_smoother */
 	if (!(pvt->sco_output_smoother = ast_smoother_new(pvt->sco_mtu))) {
@@ -9329,27 +9400,27 @@ static struct mbl_pvt *mbl_load_device(struct ast_config *cfg, const char *cat)
 		if (!strcasecmp(v->name, "context")) {
 			ast_copy_string(pvt->context, v->value, sizeof(pvt->context));
 		} else if (!strcasecmp(v->name, "sms_delete_after_read")) {
-			pvt->sms_delete_after_read = ast_true(v->value);
+			pvt->sms.delete_after_read = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "group")) {
 			/* group is set to 0 if invalid */
 			pvt->group = (int)strtol(v->value, NULL, 10);
 		} else if (!strcasecmp(v->name, "sms")) {
 			if (ast_true(v->value) || !strcasecmp(v->value, "auto")) {
 				/* Enable SMS - will be set to TEXT or PDU during init */
-				pvt->sms_mode = SMS_MODE_NO;
+				pvt->sms.mode = SMS_MODE_NO;
 			} else {
 				/* Explicitly disabled */
-				pvt->sms_mode = SMS_MODE_OFF;
+				pvt->sms.mode = SMS_MODE_OFF;
 			}
 		} else if (!strcasecmp(v->name, "nocallsetup")) {
-			pvt->no_callsetup = ast_true(v->value);
+			pvt->call.no_callsetup = ast_true(v->value);
 
-			if (pvt->no_callsetup) {
+			if (pvt->call.no_callsetup) {
 				ast_debug(1, "Setting nocallsetup mode for device %s.\n", pvt->id);
 			}
 		} else if (!strcasecmp(v->name, "blackberry")) {
 			pvt->blackberry = ast_true(v->value);
-			pvt->sms_mode = SMS_MODE_OFF;  /* BlackBerry doesn't support SMS over HFP */
+			pvt->sms.mode = SMS_MODE_OFF;  /* BlackBerry doesn't support SMS over HFP */
 		}
 	}
 
@@ -9364,7 +9435,7 @@ static struct mbl_pvt *mbl_load_device(struct ast_config *cfg, const char *cat)
 
 	pvt->hfp->owner = pvt;
 	pvt->hfp->rfcomm_port = pvt->rfcomm_port;
-	pvt->hfp->nocallsetup = pvt->no_callsetup;
+	pvt->hfp->nocallsetup = pvt->call.no_callsetup;
 	/* Initialize device status fields to unknown */
 	pvt->hfp->battery_percent = -1;
 	pvt->hfp->charging = -1;
