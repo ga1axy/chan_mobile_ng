@@ -509,6 +509,26 @@ static int mbl_queue_hangup(struct mbl_pvt *pvt);
 static int mbl_initiate_hangup(struct mbl_pvt *pvt);
 static int mbl_has_service(struct mbl_pvt *pvt);
 
+/*
+ * Common helper forward declarations.
+ * Implementations appear just before the first caller that requires them.
+ */
+
+/*! rfkill block states returned by hci_rfkill_state(). */
+enum rfkill_state {
+	RFKILL_STATE_NONE = 0, /*!< adapter is not rfkill-blocked */
+	RFKILL_STATE_SOFT,     /*!< software (reversible) block */
+	RFKILL_STATE_HARD,     /*!< hardware (irreversible) block */
+};
+
+static struct mbl_pvt   *mbl_find_device_by_id(const char *id);
+static enum rfkill_state hci_rfkill_state(int hci_device_id);
+static int               hfp_send_reg_cmd(struct hfp_pvt *hfp, const char *at_cmd, int mode);
+static int               hfp_send_at_int(struct hfp_pvt *hfp, const char *at_cmd, int value);
+static int               hfp_send_vg_level(struct hfp_pvt *hfp, char which, int value);
+static int               hfp_battery_pct(const struct hfp_pvt *hfp);
+static int               handle_call_congestion(struct mbl_pvt *pvt, const char *reason);
+
 static int rfcomm_connect(bdaddr_t src, bdaddr_t dst, int remote_channel)
 	__attribute__((warn_unused_result));
 static int rfcomm_write(int rfcomm_sock, const char *buf);
@@ -992,12 +1012,9 @@ static char *handle_cli_mobile_show_devices(struct ast_cli_entry *e, int cmd, st
 
 		/* Battery status */
 		if (pvt->hfp && pvt->hfp->initialized) {
-			if (pvt->hfp->battery_percent >= 0) {
-				snprintf(batt_str, sizeof(batt_str), "%d%%", pvt->hfp->battery_percent);
-			} else {
-				int batt = pvt->hfp->cind_state[pvt->hfp->cind_map.battchg];
-				snprintf(batt_str, sizeof(batt_str), "~%d%%", batt * 20);
-			}
+			snprintf(batt_str, sizeof(batt_str), "%s%d%%",
+				pvt->hfp->battery_percent >= 0 ? "" : "~",
+				hfp_battery_pct(pvt->hfp));
 		} else {
 			ast_copy_string(batt_str, "-", sizeof(batt_str));
 		}
@@ -1074,16 +1091,10 @@ static char *handle_cli_mobile_show_device(struct ast_cli_entry *e, int cmd, str
 		return CLI_SHOWUSAGE;
 	}
 
-	AST_RWLIST_RDLOCK(&devices);
-	AST_RWLIST_TRAVERSE(&devices, pvt, entry) {
-		if (!strcmp(pvt->id, a->argv[3])) {
-			break;
-		}
-	}
+	pvt = mbl_find_device_by_id(a->argv[3]);
 
 	if (!pvt) {
 		ast_cli(a->fd, "Device '%s' not found\n", a->argv[3]);
-		AST_RWLIST_UNLOCK(&devices);
 		return CLI_SUCCESS;
 	}
 
@@ -1118,10 +1129,9 @@ static char *handle_cli_mobile_show_device(struct ast_cli_entry *e, int cmd, str
 			if (pvt->hfp->battery_percent >= 0) {
 				const char *chrg = pvt->hfp->charging == 1 ? "Charging" :
 				                   pvt->hfp->charging == 0 ? "Discharging" : "Unknown";
-				ast_cli(a->fd, "Battery: %d%% (%s)\n", pvt->hfp->battery_percent, chrg);
+				ast_cli(a->fd, "Battery: %d%% (%s)\n", hfp_battery_pct(pvt->hfp), chrg);
 			} else {
-				int batt = pvt->hfp->cind_state[pvt->hfp->cind_map.battchg];
-				ast_cli(a->fd, "Battery: ~%d%% (HFP)\n", batt * 20);
+				ast_cli(a->fd, "Battery: ~%d%% (HFP)\n", hfp_battery_pct(pvt->hfp));
 			}
 
 			/* Provider information */
@@ -1220,51 +1230,9 @@ static char *handle_cli_mobile_show_adapters(struct ast_cli_entry *e, int cmd, s
 
 		/* Check rfkill status from sysfs - only if adapter is present */
 		if (adapter->hci_device_id >= 0 && strcmp(power_status, "Gone") != 0) {
-			char hci_path[128];
-			DIR *hci_dir;
-
-			snprintf(hci_path, sizeof(hci_path), "/sys/class/bluetooth/hci%d", adapter->hci_device_id);
-			hci_dir = opendir(hci_path);
-			if (hci_dir) {
-				struct dirent *entry;
-				while ((entry = readdir(hci_dir)) != NULL) {
-					if (strncmp(entry->d_name, "rfkill", 6) == 0) {
-						char soft_path[256], hard_path[256];
-						int soft = 0, hard = 0;
-						FILE *f;
-
-						/* Read soft block */
-						snprintf(soft_path, sizeof(soft_path), "%s/%s/soft", hci_path, entry->d_name);
-						f = fopen(soft_path, "r");
-						if (f) {
-							if (fscanf(f, "%d", &soft) != 1) {
-								soft = 0;
-							}
-							fclose(f);
-						}
-
-						/* Read hard block */
-						snprintf(hard_path, sizeof(hard_path), "%s/%s/hard", hci_path, entry->d_name);
-						f = fopen(hard_path, "r");
-						if (f) {
-							if (fscanf(f, "%d", &hard) != 1) {
-								hard = 0;
-							}
-							fclose(f);
-						}
-
-						if (hard) {
-							rfkill_status = "Hard";
-						} else if (soft) {
-							rfkill_status = "Soft";
-						} else {
-							rfkill_status = "OK";
-						}
-						break;  /* Found rfkill for this hci device */
-					}
-				}
-				closedir(hci_dir);
-			}
+			enum rfkill_state rk = hci_rfkill_state(adapter->hci_device_id);
+			rfkill_status = (rk == RFKILL_STATE_HARD) ? "Hard" :
+			                (rk == RFKILL_STATE_SOFT) ? "Soft" : "OK";
 		}
 
 		ast_cli(a->fd, FORMAT1,
@@ -1499,13 +1467,7 @@ static char *handle_cli_mobile_rfcomm(struct ast_cli_entry *e, int cmd, struct a
 		return CLI_SHOWUSAGE;
 	}
 
-	AST_RWLIST_RDLOCK(&devices);
-	AST_RWLIST_TRAVERSE(&devices, pvt, entry) {
-		if (!strcmp(pvt->id, a->argv[2])) {
-			break;
-		}
-	}
-	AST_RWLIST_UNLOCK(&devices);
+	pvt = mbl_find_device_by_id(a->argv[2]);
 
 	if (!pvt) {
 		ast_cli(a->fd, "Device %s not found.\n", a->argv[2]);
@@ -1549,13 +1511,7 @@ static char *handle_cli_mobile_cusd(struct ast_cli_entry *e, int cmd, struct ast
 		return CLI_SHOWUSAGE;
 	}
 
-	AST_RWLIST_RDLOCK(&devices);
-	AST_RWLIST_TRAVERSE(&devices, pvt, entry) {
-		if (!strcmp(pvt->id, a->argv[2])) {
-			break;
-		}
-	}
-	AST_RWLIST_UNLOCK(&devices);
+	pvt = mbl_find_device_by_id(a->argv[2]);
 
 	if (!pvt) {
 		ast_cli(a->fd, "Device %s not found.\n", a->argv[2]);
@@ -1681,13 +1637,8 @@ static int mbl_status_read(struct ast_channel *chan, const char *cmd, char *data
 				}
 			}
 		} else if (!strcasecmp(args.type, "BATTERY")) {
-			if (pvt->hfp) {
-				if (pvt->hfp->battery_percent >= 0) {
-					snprintf(buf, len, "%d", pvt->hfp->battery_percent);
-				} else if (pvt->hfp->initialized) {
-					snprintf(buf, len, "%d",
-						pvt->hfp->cind_state[pvt->hfp->cind_map.battchg] * 20);
-				}
+			if (pvt->hfp && (pvt->hfp->battery_percent >= 0 || pvt->hfp->initialized)) {
+				snprintf(buf, len, "%d", hfp_battery_pct(pvt->hfp));
 			}
 		} else if (!strcasecmp(args.type, "CHARGING")) {
 			if (pvt->hfp && pvt->hfp->charging >= 0) {
@@ -1741,13 +1692,7 @@ static int mbl_sendsms_exec(struct ast_channel *ast, const char *data)
 		return -1;
 	}
 
-	AST_RWLIST_RDLOCK(&devices);
-	AST_RWLIST_TRAVERSE(&devices, pvt, entry) {
-		if (!strcmp(pvt->id, args.device)) {
-			break;
-		}
-	}
-	AST_RWLIST_UNLOCK(&devices);
+	pvt = mbl_find_device_by_id(args.device);
 
 	if (!pvt) {
 		ast_log(LOG_ERROR, "Bluetooth device %s wasn't found in the list -- SMS will not be sent.\n", args.device);
@@ -2159,13 +2104,7 @@ static int mbl_devicestate(const char *data)
 
 	ast_debug(1, "Checking device state for device %s\n", device);
 
-	AST_RWLIST_RDLOCK(&devices);
-	AST_RWLIST_TRAVERSE(&devices, pvt, entry) {
-		if (!strcmp(pvt->id, device)) {
-			break;
-		}
-	}
-	AST_RWLIST_UNLOCK(&devices);
+	pvt = mbl_find_device_by_id(device);
 
 	if (!pvt) {
 		return res;
@@ -2304,7 +2243,161 @@ static int mbl_has_service(struct mbl_pvt *pvt)
 		|| pvt->hfp->cind_state[pvt->hfp->cind_map.service] == HFP_CIND_SERVICE_AVAILABLE;
 }
 
-/* rfcomm helpers */
+/*
+ * Common helpers
+ */
+
+/*!
+ * \brief Find a device by its configuration ID.
+ *
+ * Acquires and immediately releases the devices list read lock, so the
+ * returned pointer is only safe to use as long as the device list is
+ * stable (i.e. the module is loaded and not currently being unloaded).
+ * Callers that need to operate on the device must take \c pvt->lock
+ * separately after this returns.
+ *
+ * \param id Device ID string (from chan_mobile.conf).
+ * \return Pointer to the matching \c mbl_pvt, or \c NULL if not found.
+ */
+static struct mbl_pvt *mbl_find_device_by_id(const char *id)
+{
+	struct mbl_pvt *pvt;
+
+	AST_RWLIST_RDLOCK(&devices);
+	AST_RWLIST_TRAVERSE(&devices, pvt, entry) {
+		if (!strcmp(pvt->id, id)) {
+			break;
+		}
+	}
+	AST_RWLIST_UNLOCK(&devices);
+
+	return pvt;
+}
+
+/*!
+ * \brief Read the rfkill block state for an HCI device from sysfs.
+ *
+ * Inspects \c /sys/class/bluetooth/hciN/rfkillM/{soft,hard} to determine
+ * whether the adapter is blocked by the kernel rfkill subsystem.
+ *
+ * \param hci_device_id  HCI device index (e.g. 0 for hci0).
+ * \retval RFKILL_STATE_HARD  Hardware (irreversible) block.
+ * \retval RFKILL_STATE_SOFT  Software (reversible) block.
+ * \retval RFKILL_STATE_NONE  Not blocked, or sysfs path not found.
+ */
+static enum rfkill_state hci_rfkill_state(int hci_device_id)
+{
+	char hci_path[128];
+	DIR *hci_dir;
+	struct dirent *de;
+	enum rfkill_state state = RFKILL_STATE_NONE;
+
+	snprintf(hci_path, sizeof(hci_path), "/sys/class/bluetooth/hci%d", hci_device_id);
+	hci_dir = opendir(hci_path);
+	if (!hci_dir) {
+		return RFKILL_STATE_NONE;
+	}
+
+	while ((de = readdir(hci_dir)) != NULL) {
+		if (strncmp(de->d_name, "rfkill", 6) != 0) {
+			continue;
+		}
+
+		char path[256];
+		int soft = 0, hard = 0;
+		FILE *f;
+
+		/* Read soft-block flag */
+		snprintf(path, sizeof(path), "%s/%s/soft", hci_path, de->d_name);
+		f = fopen(path, "r");
+		if (f) {
+			if (fscanf(f, "%d", &soft) != 1) {
+				soft = 0;
+			}
+			fclose(f);
+		}
+
+		/* Read hard-block flag */
+		snprintf(path, sizeof(path), "%s/%s/hard", hci_path, de->d_name);
+		f = fopen(path, "r");
+		if (f) {
+			if (fscanf(f, "%d", &hard) != 1) {
+				hard = 0;
+			}
+			fclose(f);
+		}
+
+		if (hard) {
+			state = RFKILL_STATE_HARD;
+		} else if (soft) {
+			state = RFKILL_STATE_SOFT;
+		}
+		break; /* Only one rfkill entry per HCI device */
+	}
+	closedir(hci_dir);
+	return state;
+}
+
+/*!
+ * \brief Send a registration-style AT command (AT+CREG / AT+CGREG).
+ *
+ * Both commands follow the same shape:
+ *   \li \c mode < 0  → send a query: \c AT+<cmd>?\r
+ *   \li \c mode >= 0 → send a set:   \c AT+<cmd>=<mode>\r
+ *
+ * \param hfp     HFP private structure whose rfcomm socket to write to.
+ * \param at_cmd  AT command prefix including the \c AT+ part (e.g. \c "AT+CREG").
+ * \param mode    Value to set, or \c -1 to query current state.
+ * \retval 0 on success, -1 on write error.
+ */
+static int hfp_send_reg_cmd(struct hfp_pvt *hfp, const char *at_cmd, int mode)
+{
+	char cmd[32];
+
+	if (mode < 0) {
+		snprintf(cmd, sizeof(cmd), "%s?\r", at_cmd);
+	} else {
+		snprintf(cmd, sizeof(cmd), "%s=%d\r", at_cmd, mode);
+	}
+	return rfcomm_write(hfp->rfcomm_sock, cmd);
+}
+
+/*!
+ * \brief Send a simple \c AT+CMD=<value> command.
+ *
+ * Many HFP commands have the shape \c AT+XXXX=<integer>\r.  This helper
+ * avoids repeating the snprintf/rfcomm_write boilerplate for each one.
+ *
+ * \param hfp     HFP private structure.
+ * \param at_cmd  Full AT command prefix including \c AT+ (e.g. \c "AT+CMGF").
+ * \param value   Integer argument.
+ * \retval 0 on success, -1 on write error.
+ */
+static int hfp_send_at_int(struct hfp_pvt *hfp, const char *at_cmd, int value)
+{
+	char cmd[32];
+	snprintf(cmd, sizeof(cmd), "%s=%d\r", at_cmd, value);
+	return rfcomm_write(hfp->rfcomm_sock, cmd);
+}
+
+/*!
+ * \brief Return the best available battery level as a percentage (0–100).
+ *
+ * Prefers the exact percentage reported via AT+CBC (\c battery_percent ≥ 0);
+ * falls back to the 0–5 HFP CIND indicator scaled to 0–100 by steps of 20.
+ *
+ * \param hfp  Initialised HFP private structure (must not be NULL).
+ * \return Battery level in percent.
+ */
+static int hfp_battery_pct(const struct hfp_pvt *hfp)
+{
+	if (hfp->battery_percent >= 0) {
+		return hfp->battery_percent;
+	}
+	return hfp->cind_state[hfp->cind_map.battchg] * 20;
+}
+
+
 
 static int rfcomm_connect(bdaddr_t src, bdaddr_t dst, int remote_channel)
 {
@@ -3886,9 +3979,7 @@ static int hfp_send_cmgl(struct hfp_pvt *hfp, const char *status)
  */
 static int hfp_send_cmgd(struct hfp_pvt *hfp, int index)
 {
-	char cmd[32];
-	snprintf(cmd, sizeof(cmd), "AT+CMGD=%d\r", index);
-	return rfcomm_write(hfp->rfcomm_sock, cmd);
+	return hfp_send_at_int(hfp, "AT+CMGD", index);
 }
 
 /*!
@@ -3911,16 +4002,10 @@ static int hfp_parse_cmgl_response(struct hfp_pvt *hfp, char *buf)
 static void hfp_parse_cpms_response(struct hfp_pvt *hfp, char *buf, int *used, int *total)
 {
 	int u = 0, t = 0;
-	/* Check for response format +CPMS: "SM",1,10,... or +CPMS: 1,10,... */
-	/* Often it's +CPMS: <used1>,<total1>,<used2>,<total2>,... */
-	if (sscanf(buf, "+CPMS: %d,%d", &u, &t) == 2) {
-		if (used) {
-			*used = u;
-		}
-		if (total) {
-			*total = t;
-		}
-	} else if (sscanf(buf, "+CPMS: \"%*[^\"]\",%d,%d", &u, &t) == 2) {
+	/* Accept either "+CPMS: <used>,<total>,..." or "+CPMS: "mem",<used>,<total>,..." */
+	int matched = (sscanf(buf, "+CPMS: %d,%d", &u, &t) == 2)
+	           || (sscanf(buf, "+CPMS: \"%*[^\"]\",%d,%d", &u, &t) == 2);
+	if (matched) {
 		if (used) {
 			*used = u;
 		}
@@ -3961,15 +4046,31 @@ static int hfp_send_cmer(struct hfp_pvt *hfp, int status)
 }
 
 /*!
+ * \brief Send a VG (volume gain) level command.
+ *
+ * Both speaker gain (AT+VGS) and microphone gain (AT+VGM) share the same
+ * format; only the letter differs.
+ *
+ * \param hfp   HFP private structure.
+ * \param which Either \c 'S' (speaker) or \c 'M' (microphone).
+ * \param value Gain level, 0–15.
+ * \retval 0 on success, -1 on write error.
+ */
+static int hfp_send_vg_level(struct hfp_pvt *hfp, char which, int value)
+{
+	char cmd[32];
+	snprintf(cmd, sizeof(cmd), "AT+VG%c=%d\r", which, value);
+	return rfcomm_write(hfp->rfcomm_sock, cmd);
+}
+
+/*!
  * \brief Send the current speaker gain level.
  * \param hfp an hfp_pvt struct
  * \param value the value to send (must be between 0 and 15)
  */
 static int hfp_send_vgs(struct hfp_pvt *hfp, int value)
 {
-	char cmd[32];
-	snprintf(cmd, sizeof(cmd), "AT+VGS=%d\r", value);
-	return rfcomm_write(hfp->rfcomm_sock, cmd);
+	return hfp_send_vg_level(hfp, 'S', value);
 }
 
 /*!
@@ -3979,9 +4080,7 @@ static int hfp_send_vgs(struct hfp_pvt *hfp, int value)
  */
 static int hfp_send_vgm(struct hfp_pvt *hfp, int value)
 {
-	char cmd[32];
-	snprintf(cmd, sizeof(cmd), "AT+VGM=%d\r", value);
-	return rfcomm_write(hfp->rfcomm_sock, cmd);
+	return hfp_send_vg_level(hfp, 'M', value);
 }
 
 /*!
@@ -4010,13 +4109,7 @@ static int hfp_send_cscs(struct hfp_pvt *hfp, const char *charset)
  */
 static int hfp_send_creg(struct hfp_pvt *hfp, int mode)
 {
-	char cmd[32];
-	if (mode < 0) {
-		snprintf(cmd, sizeof(cmd), "AT+CREG?\r");
-	} else {
-		snprintf(cmd, sizeof(cmd), "AT+CREG=%d\r", mode);
-	}
-	return rfcomm_write(hfp->rfcomm_sock, cmd);
+	return hfp_send_reg_cmd(hfp, "AT+CREG", mode);
 }
 
 /*!
@@ -4027,13 +4120,7 @@ static int hfp_send_creg(struct hfp_pvt *hfp, int mode)
  */
 static int hfp_send_cgreg(struct hfp_pvt *hfp, int mode)
 {
-	char cmd[32];
-	if (mode < 0) {
-		snprintf(cmd, sizeof(cmd), "AT+CGREG?\r");
-	} else {
-		snprintf(cmd, sizeof(cmd), "AT+CGREG=%d\r", mode);
-	}
-	return rfcomm_write(hfp->rfcomm_sock, cmd);
+	return hfp_send_reg_cmd(hfp, "AT+CGREG", mode);
 }
 
 /*!
@@ -4082,9 +4169,7 @@ static int hfp_send_cbc(struct hfp_pvt *hfp)
  */
 static int hfp_send_clip(struct hfp_pvt *hfp, int status)
 {
-	char cmd[32];
-	snprintf(cmd, sizeof(cmd), "AT+CLIP=%d\r", status ? 1 : 0);
-	return rfcomm_write(hfp->rfcomm_sock, cmd);
+	return hfp_send_at_int(hfp, "AT+CLIP", status ? 1 : 0);
 }
 
 /*!
@@ -4124,9 +4209,7 @@ static int hfp_send_dtmf(struct hfp_pvt *hfp, char digit)
  */
 static int hfp_send_cmgf(struct hfp_pvt *hfp, int mode)
 {
-	char cmd[32];
-	snprintf(cmd, sizeof(cmd), "AT+CMGF=%d\r", mode);
-	return rfcomm_write(hfp->rfcomm_sock, cmd);
+	return hfp_send_at_int(hfp, "AT+CMGF", mode);
 }
 
 /*!
@@ -4401,9 +4484,7 @@ static void cnmi_log_parsed(const char *devid, const int8_t *mode_vals, const in
  */
 static int hfp_send_cmgr(struct hfp_pvt *hfp, int index)
 {
-	char cmd[32];
-	snprintf(cmd, sizeof(cmd), "AT+CMGR=%d\r", index);
-	return rfcomm_write(hfp->rfcomm_sock, cmd);
+	return hfp_send_at_int(hfp, "AT+CMGR", index);
 }
 
 /*!
@@ -4747,15 +4828,7 @@ static int hfp_parse_cind_test(struct hfp_pvt *hfp, char *buf)
  */
 static int msg_queue_push(struct mbl_pvt *pvt, enum at_message expect, enum at_message response_to)
 {
-	struct msg_queue_entry *msg;
-	if (!(msg = ast_calloc(1, sizeof(*msg)))) {
-		return -1;
-	}
-	msg->expected = expect;
-	msg->response_to = response_to;
-
-	AST_LIST_INSERT_TAIL(&pvt->msg_queue, msg, entry);
-	return 0;
+	return msg_queue_push_data(pvt, expect, response_to, NULL);
 }
 
 /*!
@@ -7562,13 +7635,7 @@ static int mobile_msg_send(const struct ast_msg *msg, const char *to, const char
 	}
 
 	/* Find the device */
-	AST_RWLIST_RDLOCK(&devices);
-	AST_RWLIST_TRAVERSE(&devices, pvt, entry) {
-		if (!strcmp(pvt->id, device_id)) {
-			break;
-		}
-	}
-	AST_RWLIST_UNLOCK(&devices);
+	pvt = mbl_find_device_by_id(device_id);
 
 	if (!pvt) {
 		ast_log(LOG_ERROR, "mobile MESSAGE: device '%s' not found\n", device_id);
@@ -8144,6 +8211,24 @@ static int handle_response_cmgl(struct mbl_pvt *pvt, char *buf)
  * \retval 0 success
  * \retval -1 error
  */
+/*!
+ * \brief Signal call-clearing congestion on a pvt.
+ *
+ * Common body shared by \c handle_response_no_dialtone and
+ * \c handle_response_no_carrier — both log a caller-supplied \p reason string,
+ * mark the call as needing a CHUP, and send AST_CONTROL_CONGESTION.
+ *
+ * \param pvt    Device private structure (locked by caller).
+ * \param reason Human-readable reason to log (e.g. "NO DIALTONE").
+ */
+static int handle_call_congestion(struct mbl_pvt *pvt, const char *reason)
+{
+	ast_verb(1, "[%s] mobile reports %s\n", pvt->id, reason);
+	pvt->call.needchup = true;
+	mbl_queue_control(pvt, AST_CONTROL_CONGESTION);
+	return 0;
+}
+
 static int handle_response_busy(struct mbl_pvt *pvt)
 {
 	pvt->call.hangup_cause = AST_CAUSE_USER_BUSY;
@@ -8161,10 +8246,7 @@ static int handle_response_busy(struct mbl_pvt *pvt)
  */
 static int handle_response_no_dialtone(struct mbl_pvt *pvt, char *buf)
 {
-	ast_verb(1, "[%s] mobile reports NO DIALTONE\n", pvt->id);
-	pvt->call.needchup = true;
-	mbl_queue_control(pvt, AST_CONTROL_CONGESTION);
-	return 0;
+	return handle_call_congestion(pvt, "NO DIALTONE");
 }
 
 /*!
@@ -8176,10 +8258,7 @@ static int handle_response_no_dialtone(struct mbl_pvt *pvt, char *buf)
  */
 static int handle_response_no_carrier(struct mbl_pvt *pvt, char *buf)
 {
-	ast_verb(1, "[%s] mobile reports NO CARRIER\n", pvt->id);
-	pvt->call.needchup = true;
-	mbl_queue_control(pvt, AST_CONTROL_CONGESTION);
-	return 0;
+	return handle_call_congestion(pvt, "NO CARRIER");
 }
 
 static void *do_monitor_phone(void *data)
@@ -8864,53 +8943,14 @@ static void *do_discovery(void *data)
 						di.dev_id = adapter->hci_device_id;
 						if (ioctl(ctl_sock, HCIGETDEVINFO, &di) == 0) {
 							/* Check for RFKill first - do not attempt power on if blocked */
-							char hci_path[128];
-							DIR *hci_dir;
-							int rfkill_blocked = 0;
-
-							snprintf(hci_path, sizeof(hci_path), "/sys/class/bluetooth/hci%d", adapter->hci_device_id);
-							hci_dir = opendir(hci_path);
-							if (hci_dir) {
-								struct dirent *entry;
-								while ((entry = readdir(hci_dir)) != NULL) {
-									if (strncmp(entry->d_name, "rfkill", 6) == 0) {
-										char soft_path[256], hard_path[256];
-										int soft = 0, hard = 0;
-										FILE *f;
-
-										/* Read soft block */
-										snprintf(soft_path, sizeof(soft_path), "%s/%s/soft", hci_path, entry->d_name);
-										f = fopen(soft_path, "r");
-										if (f) {
-											if (fscanf(f, "%d", &soft) != 1) {
-												soft = 0;
-											}
-											fclose(f);
-										}
-
-										/* Read hard block */
-										snprintf(hard_path, sizeof(hard_path), "%s/%s/hard", hci_path, entry->d_name);
-										f = fopen(hard_path, "r");
-										if (f) {
-											if (fscanf(f, "%d", &hard) != 1) {
-												hard = 0;
-											}
-											fclose(f);
-										}
-
-										if (soft || hard) {
-											rfkill_blocked = 1;
-											ast_verb(3, "Adapter %s is %s blocked\n",
-												adapter->id, hard ? "Hardware" : "Software");
-											break;
-										}
-									}
+							{
+								enum rfkill_state rk = hci_rfkill_state(adapter->hci_device_id);
+								if (rk != RFKILL_STATE_NONE) {
+									ast_verb(3, "Adapter %s is %s blocked\n",
+										adapter->id,
+										(rk == RFKILL_STATE_HARD) ? "Hardware" : "Software");
+									continue; /* Skip this adapter if RF killed */
 								}
-								closedir(hci_dir);
-							}
-
-							if (rfkill_blocked) {
-								continue; /* Skip this adapter if RF killed */
 							}
 
 							if (!(di.flags & (1 << HCI_UP))) {
